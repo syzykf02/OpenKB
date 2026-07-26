@@ -50,12 +50,17 @@ dependencies = [
     "prompt_toolkit==3.0.52",
     "rich==15.0.0",
     "portalocker==3.2.0",
+    "fastapi>=0.139.0",
 ]
 
 [project.urls]
 Repository = "https://github.com/VectifyAI/OpenKB"
 Homepage = "https://github.com/VectifyAI/OpenKB"
 Issues = "https://github.com/VectifyAI/OpenKB/issues"
+
+[[tool.uv.index]]
+url = "https://mirrors.aliyun.com/pypi/simple"
+default = true
 
 [project.scripts]
 openkb = "openkb.cli:cli"
