@@ -3,7 +3,7 @@ import { useNavigate, useParams } from 'react-router'
 import { useTranslation } from 'react-i18next'
 import * as Dialog from '@radix-ui/react-dialog'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
-import { FileText, Link2, Loader2, Pencil, Upload, RefreshCw, Settings2, Trash2, Circle, CheckCircle2, CircleSlash2, XCircle, X, BookOpen } from 'lucide-react'
+import { FileText, Link2, Loader2, Pencil, Upload, RefreshCw, Settings2, Trash2, Circle, CheckCircle2, CircleSlash2, XCircle, X, BookOpen, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight } from 'lucide-react'
 import { toast } from 'sonner'
 import { deletePage, editPage, getDocumentSource, getKbInventory, getPage, getPageLinks, type DocumentSource, type KbInventory, type WikiDocument } from '@/api/wiki'
 import { streamUpload, removeDocument, type AddResult } from '@/api/maintenance'
@@ -862,6 +862,12 @@ function DocumentReaderDrawer({
   loading,
   error,
   isEmpty,
+  page,
+  totalPages,
+  onFirst,
+  onPrev,
+  onNext,
+  onLast,
   onRetry,
   onClose,
 }: {
@@ -870,6 +876,12 @@ function DocumentReaderDrawer({
   loading: boolean
   error: string | null
   isEmpty: boolean
+  page: number
+  totalPages: number
+  onFirst: () => void
+  onPrev: () => void
+  onNext: () => void
+  onLast: () => void
   onRetry: () => void
   onClose: () => void
 }) {
@@ -885,14 +897,38 @@ function DocumentReaderDrawer({
   useEffect(() => {
     if (doc) setShown(doc)
   }, [doc])
-  // Reset scroll to top when switching documents.
+  // Reset scroll to top when switching documents or turning pages.
   useEffect(() => {
     if (doc) scrollRef.current?.scrollTo(0, 0)
-  }, [doc])
+  }, [doc, page])
+  // `modal={false}` (below) sidesteps Radix's react-remove-scroll, whose
+  // document-level wheel listener cancels wheel over the reader body via a
+  // React-18 timing gap. The trade-off: Radix no longer applies its own
+  // body-scroll lock or Esc-to-close (the DismissableLayer escape listener
+  // only attaches when it is the highest layer, which is unreliable with
+  // `forceMount` + `AnimatePresence` ref timing). Restore both here.
+  useEffect(() => {
+    if (!open) return
+    const prev = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      const t = e.target as HTMLElement | null
+      const tag = t?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || t?.isContentEditable) return
+      onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => {
+      document.body.style.overflow = prev
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [open, onClose])
 
   return (
     <Dialog.Root
       open={open}
+      modal={false}
       onOpenChange={(next) => {
         if (!next) onClose()
       }}
@@ -900,20 +936,21 @@ function DocumentReaderDrawer({
       <AnimatePresence>
         {open && (
           <Dialog.Portal forceMount>
-            <Dialog.Overlay asChild forceMount>
-              <motion.div
-                className="fixed inset-0 z-40 bg-black/30"
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                transition={reduce ? { duration: 0.12 } : { duration: 0.2 }}
-                onClick={onClose}
-              />
-            </Dialog.Overlay>
+            {/* Radix `Dialog.Overlay` renders null when `modal={false}`
+                (see @radix-ui/react-dialog: `context.modal ? ... : null`),
+                so render the backdrop as a plain motion.div instead - it
+                still portals above the page and `onClick` closes. */}
+            <motion.div
+              className="fixed inset-0 z-40 bg-black/30"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={reduce ? { duration: 0.12 } : { duration: 0.2 }}
+              onClick={onClose}
+            />
             <Dialog.Content
               asChild
               forceMount
-              aria-modal="true"
               aria-describedby={undefined}
               onOpenAutoFocus={() => {
                 openerRef.current = document.activeElement as HTMLElement | null
@@ -922,6 +959,13 @@ function DocumentReaderDrawer({
                 e.preventDefault()
                 openerRef.current?.focus()
               }}
+              // Route outside-dismiss only through the overlay's own
+              // `onClick` below: the backdrop is a sibling of the content
+              // (hence "outside" to Radix), and `modal={false}` no longer
+              // auto-closes on focus loss, so these guards avoid a redundant
+              // DismissableLayer dismissal competing with the backdrop click.
+              onPointerDownOutside={(e) => e.preventDefault()}
+              onInteractOutside={(e) => e.preventDefault()}
             >
               <motion.aside
                 className="fixed inset-y-0 right-0 z-50 flex w-[min(70vw,900px)] max-w-full flex-col glass border-l border-[hsl(var(--glass-border))] shadow-glass-lg rounded-l-apple-lg"
@@ -981,7 +1025,9 @@ function DocumentReaderDrawer({
                     )}
                     {!loading && !error && isEmpty && (
                       <div className="py-16 text-center text-[13px] text-muted-foreground">
-                        {t('kb:docs.reader.emptyDoc')}
+                        {totalPages > 1
+                          ? t('kb:docs.reader.emptyPage')
+                          : t('kb:docs.reader.emptyDoc')}
                       </div>
                     )}
                     {!loading && !error && !isEmpty && (
@@ -989,6 +1035,57 @@ function DocumentReaderDrawer({
                     )}
                   </div>
                 </div>
+
+                {/* Page navigation: hidden for single-page (short) docs. Prev/next
+                    disabled at the ends so keyboard activation is a no-op, not a
+                    wrap-around. */}
+                {totalPages > 1 && (
+                  <div className="flex shrink-0 items-center justify-center gap-1.5 border-t border-[hsl(var(--glass-border))] px-5 py-2.5">
+                    <button
+                      type="button"
+                      onClick={onFirst}
+                      disabled={page <= 1}
+                      aria-label={t('kb:docs.reader.firstPage')}
+                      title={t('kb:docs.reader.firstPage')}
+                      className="grid h-8 w-8 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
+                    >
+                      <ChevronsLeft className="h-4 w-4" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={onPrev}
+                      disabled={page <= 1}
+                      aria-label={t('kb:docs.reader.prevPage')}
+                      title={t('kb:docs.reader.prevPage')}
+                      className="grid h-8 w-8 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
+                    >
+                      <ChevronLeft className="h-4 w-4" />
+                    </button>
+                    <span className="min-w-[5.5rem] text-center text-[12px] tabular-nums text-muted-foreground">
+                      {t('kb:docs.reader.pageOf', { page, total: totalPages })}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={onNext}
+                      disabled={page >= totalPages}
+                      aria-label={t('kb:docs.reader.nextPage')}
+                      title={t('kb:docs.reader.nextPage')}
+                      className="grid h-8 w-8 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
+                    >
+                      <ChevronRight className="h-4 w-4" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={onLast}
+                      disabled={page >= totalPages}
+                      aria-label={t('kb:docs.reader.lastPage')}
+                      title={t('kb:docs.reader.lastPage')}
+                      className="grid h-8 w-8 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
+                    >
+                      <ChevronsRight className="h-4 w-4" />
+                    </button>
+                  </div>
+                )}
               </motion.aside>
             </Dialog.Content>
           </Dialog.Portal>
@@ -1039,8 +1136,25 @@ function DocumentsPane({
   const [docLoading, setDocLoading] = useState(false)
   const [docError, setDocError] = useState<string | null>(null)
   const [docReloadSeq, setDocReloadSeq] = useState(0)
+  // Current source page (1-indexed) for the open doc. Long docs paginate one
+  // page per request; short docs are a single page.
+  const [docPage, setDocPage] = useState(1)
+  // Last known total page count for the open doc. Persisted across page-change
+  // fetches (which null `docSource` while loading) so the footer - and the
+  // focused prev/next button inside it - stays mounted; otherwise Radix Dialog
+  // closes when the focused button unmounts mid-click.
+  const [docTotalPages, setDocTotalPages] = useState(1)
   const sourceCache = useRef<Map<string, DocumentSource>>(new Map())
   const closeDrawer = useCallback(() => setOpenDoc(null), [])
+  // Opening a (different) doc resets to page 1 and clears the cached total so
+  // the footer doesn't briefly show the previous doc's page count. Done here
+  // in the open handler (not an effect) to avoid a set-state-in-effect render
+  // cascade and a flash of the wrong page.
+  const openDocAt = useCallback((d: WikiDocument) => {
+    setDocPage(1)
+    setDocTotalPages(1)
+    setOpenDoc(d)
+  }, [])
   const openHash = openDoc?.hash ?? null
 
   // Drop cached content when the inventory changes (a recompile can rewrite a
@@ -1050,10 +1164,12 @@ function DocumentsPane({
     sourceCache.current.clear()
   }, [documents])
 
-  // Fetch the open document's source (per-hash cache; retry via docReloadSeq).
+  // Fetch the open document's current page (per-`hash:page` cache; retry via
+  // docReloadSeq). Cached pages render instantly without a refetch.
   useEffect(() => {
     if (!openHash) return
-    const cached = sourceCache.current.get(openHash)
+    const cacheKey = `${openHash}:${docPage}`
+    const cached = sourceCache.current.get(cacheKey)
     if (cached) {
       setDocSource(cached)
       setDocError(null)
@@ -1064,11 +1180,12 @@ function DocumentsPane({
     setDocLoading(true)
     setDocSource(null)
     setDocError(null)
-    getDocumentSource(kb, openHash)
+    getDocumentSource(kb, openHash, docPage)
       .then((r) => {
         if (cancelled) return
-        sourceCache.current.set(openHash, r)
+        sourceCache.current.set(cacheKey, r)
         setDocSource(r)
+        setDocTotalPages(r.total_pages)
       })
       .catch((e) => {
         if (!cancelled) setDocError(errMsg(e))
@@ -1079,7 +1196,7 @@ function DocumentsPane({
     return () => {
       cancelled = true
     }
-  }, [kb, openHash, docReloadSeq])
+  }, [kb, openHash, docPage, docReloadSeq])
 
   // Parse Markdown once per fetched source (stable cache ref → no re-parse).
   const readerBody = useMemo(
@@ -1209,7 +1326,7 @@ function DocumentsPane({
                   no event-propagation guard is needed. */}
               <button
                 type="button"
-                onClick={() => setOpenDoc(d)}
+                onClick={() => openDocAt(d)}
                 title={t('kb:docs.reader.open')}
                 className="flex min-w-0 flex-1 items-center gap-3 text-left rounded-xl cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-brand/50"
               >
@@ -1282,6 +1399,12 @@ function DocumentsPane({
       loading={docLoading}
       error={docError}
       isEmpty={readerEmpty}
+      page={docSource?.page ?? docPage}
+      totalPages={docSource?.total_pages ?? docTotalPages}
+      onFirst={() => setDocPage(1)}
+      onPrev={() => setDocPage((p) => Math.max(1, p - 1))}
+      onNext={() => setDocPage((p) => p + 1)}
+      onLast={() => setDocPage(docSource?.total_pages ?? docTotalPages)}
       onRetry={() => setDocReloadSeq((s) => s + 1)}
       onClose={closeDrawer}
     />
