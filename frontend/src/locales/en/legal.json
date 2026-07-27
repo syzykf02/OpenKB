@@ -1,0 +1,56 @@
+{
+  "graph": {
+    "title": "Legal Knowledge Graph",
+    "allTypes": "All types",
+    "allRelations": "All relations",
+    "nodes": "Nodes",
+    "empty": "Graph is empty. Ingest documents to auto-extract entities and relations.",
+    "selectHint": "Select a node to see its impact analysis.",
+    "impact": "Impact",
+    "noImpact": "No nodes reference this one."
+  },
+  "lifecycle": {
+    "title": "Knowledge Lifecycle",
+    "allStatus": "All status",
+    "empty": "No knowledge pages yet.",
+    "confidence": "confidence",
+    "sources": "sources",
+    "decay": "decay",
+    "confirm": "Confirm",
+    "supersede": "Supersede",
+    "history": "History",
+    "noHistory": "No history yet.",
+    "supersedePromptBy": "Page that supersedes '{{page}}':",
+    "supersedePromptReason": "Reason:",
+    "confirmed": "Confirmed {{page}}"
+  },
+  "sync": {
+    "title": "Synced Sources",
+    "add": "Add",
+    "added": "Added source {{id}}",
+    "empty": "No sync sources yet.",
+    "scan": "Scan",
+    "apply": "Apply",
+    "idPlaceholder": "Source ID",
+    "pathPlaceholder": "Directory path",
+    "diffTitle": "Diff: {{id}}",
+    "newFiles": "New files",
+    "modifiedFiles": "Modified files",
+    "deletedFiles": "Deleted files"
+  },
+  "reader": {
+    "structure": "Document structure (DocIR)"
+  },
+  "settings": {
+    "heading": "Legal knowledge base",
+    "enable": "Enable legal features",
+    "enableDesc": "When on, compilation extracts legal entity types (statute/case/court/judge/precedent/evidence/doctrine) and injects them into the entity-type list.",
+    "entityTypes": "Legal entity types",
+    "visionHeading": "Visual analysis policy",
+    "visionDesc": "Text-first, vision-second: a vision model renders a candidate page only when text cannot answer (charts / signatures / scans).",
+    "lifecycleHeading": "Lifecycle decay rates",
+    "decaySlow": "slow - structural knowledge (cause-of-action / statute framework), near-permanent",
+    "decayMedium": "medium - time-sensitive knowledge (local trial guidance)",
+    "decayFast": "fast - ephemeral knowledge (superseded old rules)"
+  }
+}

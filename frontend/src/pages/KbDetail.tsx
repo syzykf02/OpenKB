@@ -3,16 +3,20 @@ import { useNavigate, useParams } from 'react-router'
 import { useTranslation } from 'react-i18next'
 import * as Dialog from '@radix-ui/react-dialog'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
-import { FileText, Link2, Loader2, Pencil, Upload, RefreshCw, Settings2, Trash2, Circle, CheckCircle2, CircleSlash2, XCircle, X, BookOpen, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight } from 'lucide-react'
+import { FileText, Link2, Loader2, Pencil, Upload, RefreshCw, Settings2, Trash2, Circle, CheckCircle2, CircleSlash2, XCircle, X, Ban, BookOpen, ChevronLeft, ChevronRight, ChevronDown, ChevronsLeft, ChevronsRight, Eye, ListTree } from 'lucide-react'
 import { toast } from 'sonner'
 import { deletePage, editPage, getDocumentSource, getKbInventory, getPage, getPageLinks, type DocumentSource, type KbInventory, type WikiDocument } from '@/api/wiki'
-import { streamUpload, removeDocument, type AddResult } from '@/api/maintenance'
+import { getDocirByHash, type DocirNode } from '@/api/legal'
+import { startUpload, streamJobEvents, listJobs, cancelJob, removeDocument, type AddResult, type UploadEvent } from '@/api/maintenance'
 import { ApiError } from '@/api/client'
 import MarkdownView from '@/components/MarkdownView'
 import PageList from '@/components/PageList'
 import ConnectorCards from '@/components/ConnectorCards'
 import KbOverviewCards, { type Section } from '@/components/KbOverviewCards'
 import KbSettingsSheet from '@/components/KbSettingsSheet'
+import LegalGraphView from '@/components/legal/LegalGraphView'
+import LifecycleView from '@/components/legal/LifecycleView'
+import SyncSourcesView from '@/components/legal/SyncSourcesView'
 import { useAnimatedSwitch } from '@/hooks/useAnimatedSwitch'
 import { cn } from '@/lib/utils'
 
@@ -59,8 +63,9 @@ function stripFrontmatter(md: string): string {
 
 /** Per-file lifecycle during a streaming upload. `pending` → `processing`
  *  (backend `file_start`) → terminal `added`/`skipped`/`failed` (`file_done`,
- *  the `AddFileItem.status`). */
-type UploadStatus = 'pending' | 'processing' | 'added' | 'skipped' | 'failed'
+ *  the `AddFileItem.status`), or `cancelled` when the user aborts the batch
+ *  mid-upload (the server rolls the in-flight file back). */
+type UploadStatus = 'pending' | 'processing' | 'added' | 'skipped' | 'failed' | 'cancelled'
 interface UploadFileState {
   /** Stable generated id, assigned once at seed time — the React key. Rows are
    *  correlated to backend events by their array index, not this id or the
@@ -131,12 +136,20 @@ export default function KbDetail() {
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [uploading, setUploading] = useState(false)
   const [uploadFiles, setUploadFiles] = useState<UploadFileState[]>([])
+  // Live compile log lines streamed from the backend (`log` SSE frames) for
+  // the current/most-recent upload; reset at the start of each upload.
+  const [uploadLogs, setUploadLogs] = useState<string[]>([])
   const [dragActive, setDragActive] = useState(false)
   // Monotonic counter for per-row ids (React keys), and the AbortController for
-  // the in-flight upload — aborted on unmount so navigating away mid-upload
-  // cancels the request (mirrors the recompile/chat abort discipline).
+  // the in-flight job SSE VIEW — aborted on unmount to detach the view only;
+  // the server-owned job itself keeps running (cancel is an explicit endpoint).
   const rowIdSeq = useRef(0)
   const uploadAbortRef = useRef<AbortController | null>(null)
+  // The job currently watched (server-owned add job), and the job THIS session
+  // started — the only one whose completion/cancel fires toasts, so restored
+  // history from a refresh replays silently.
+  const activeJobIdRef = useRef<string | null>(null)
+  const notifyJobIdRef = useRef<string | null>(null)
   useEffect(() => () => uploadAbortRef.current?.abort(), [])
 
   const selected = useMemo(() => parseSelected(selectedPath), [selectedPath])
@@ -237,103 +250,167 @@ export default function KbDetail() {
     [refreshInventory],
   )
 
-  const doUpload = useCallback(
-    async (files: File[]) => {
-      if (files.length === 0 || uploading) return
+  /** Fold one add-job SSE event into the per-file rows and log panel. Shared
+   *  by live uploads and post-refresh re-attach (which replays history, so the
+   *  same fold rebuilds the exact same view from the server's event ring). */
+  const applyJobEvent = useCallback(
+    (jobId: string, ev: UploadEvent) => {
+      const notify = notifyJobIdRef.current === jobId
+      if (ev.type === 'file_start') {
+        setUploadFiles((prev) =>
+          prev.length > ev.index
+            ? prev.map((f, i) => (i === ev.index ? { ...f, status: 'processing' } : f))
+            : [...prev, { id: String(rowIdSeq.current++), name: ev.original_name, status: 'processing' as const }],
+        )
+      } else if (ev.type === 'file_done') {
+        setUploadFiles((prev) =>
+          prev.map((f, i) =>
+            i === ev.index
+              ? { ...f, status: ev.file.status as UploadStatus, message: ev.file.message }
+              : f,
+          ),
+        )
+      } else if (ev.type === 'log') {
+        // Keep the panel bounded on very long compiles.
+        setUploadLogs((prev) =>
+          prev.length >= 500 ? [...prev.slice(prev.length - 499), ev.message] : [...prev, ev.message],
+        )
+      } else if (ev.type === 'cancelled') {
+        setUploadFiles((prev) =>
+          prev.map((f) =>
+            f.status === 'pending' || f.status === 'processing'
+              ? { ...f, status: 'cancelled' as const }
+              : f,
+          ),
+        )
+        if (notify) toast.info(t('kb:upload.cancelledToast'))
+      } else if (ev.type === 'error') {
+        if (notify) toast.error(ev.message)
+      } else if (ev.type === 'final' && notify) {
+        // `/api/v1/add` reports per-file failures inside the summary, so branch
+        // on the real added/failed/skipped counts, not on stream completion.
+        const res: AddResult = ev.result
+        const parts = [t('kb:upload.added', { count: res.added_count })]
+        if (res.skipped_count) parts.push(t('kb:upload.skipped', { count: res.skipped_count }))
+        if (res.failed_count) parts.push(t('kb:upload.failed', { count: res.failed_count }))
+        const line = parts.join(' · ')
+        if (res.added_count === 0 && res.failed_count > 0) {
+          // Every file failed — surface the first failure's message so the
+          // user learns WHY (e.g. compile error / missing LLM API key).
+          const reason = res.files.find((f) => f.status === 'failed')?.message
+          toast.error(t('kb:upload.errorToast', { summary: line }) + (reason ? t('kb:upload.reasonSuffix', { reason }) : ''))
+        } else if (res.failed_count > 0) {
+          toast.warning(t('kb:upload.partialToast', { summary: line }))
+        } else if (res.added_count > 0) {
+          toast.success(t('kb:upload.successToast', { summary: line }))
+        } else {
+          // All skipped duplicates — neutral, not an error, not "added".
+          toast.info(t('kb:upload.existsToast', { summary: line }))
+        }
+      }
+    },
+    [t],
+  )
+
+  /** Attach the UI to one server-owned job: replays its event history (so a
+   *  page refresh restores rows + logs) then tails live frames until the job's
+   *  terminal `done`. Aborting `uploadAbortRef` detaches THIS VIEW only — the
+   *  job keeps running server-side until it finishes or is cancelled via the
+   *  cancel endpoint (that's what survives the refresh). */
+  const attachJob = useCallback(
+    async (jobId: string) => {
+      activeJobIdRef.current = jobId
       setUploading(true)
-      // Seed one row per selected file so the UI shows the full set immediately,
-      // then flip each to processing/terminal as SSE events arrive. Each row gets
-      // a stable generated id (its React key); rows are correlated to backend
-      // events by array index (event order == files order), NOT by basename, so
-      // two same-basename files from different folders no longer collide.
-      setUploadFiles(files.map((f) => ({ id: String(rowIdSeq.current++), name: f.name, status: 'pending' as const })))
-      // Fresh controller for this upload — aborted on unmount.
       const controller = new AbortController()
       uploadAbortRef.current = controller
-      let summary: AddResult | null = null
-      let streamError: string | null = null
+      let sawFinal = false
       try {
-        await streamUpload(
-          id,
-          files,
+        await streamJobEvents(
+          jobId,
           (ev) => {
-            if (ev.type === 'file_start') {
-              setUploadFiles((prev) =>
-                prev.map((f, i) => (i === ev.index ? { ...f, status: 'processing' } : f)),
-              )
-            } else if (ev.type === 'file_done') {
-              setUploadFiles((prev) =>
-                prev.map((f, i) =>
-                  i === ev.index
-                    ? { ...f, status: ev.file.status as UploadStatus, message: ev.file.message }
-                    : f,
-                ),
-              )
-            } else if (ev.type === 'final') {
-              summary = ev.result
-            } else if (ev.type === 'error') {
-              streamError = ev.message
-            }
+            if (ev.type === 'final') sawFinal = true
+            applyJobEvent(jobId, ev)
           },
           controller.signal,
         )
-        // A stream-level `error` frame, or a stream that ends WITHOUT a `final`
-        // summary, must not leave rows spinning forever — settle any still-
-        // unresolved (pending/processing) rows to failed.
-        if (streamError || !summary) {
+        if (controller.signal.aborted) return // view detached — no side effects
+        // A job can fail before producing a summary; settle any rows the
+        // failure left spinning.
+        if (!sawFinal) {
           setUploadFiles((prev) =>
             prev.map((f) =>
-              f.status === 'pending' || f.status === 'processing' ? { ...f, status: 'failed' as const } : f,
+              f.status === 'pending' || f.status === 'processing'
+                ? { ...f, status: 'failed' as const }
+                : f,
             ),
           )
         }
-        // `/api/v1/add` reports HTTP 200 even when per-file compile fails, so a
-        // clean stream does NOT mean success — branch on the real
-        // added/failed/skipped counts from the `final` summary event.
-        if (streamError) {
-          toast.error(streamError)
-        } else if (summary) {
-          const res: AddResult = summary
-          const parts = [t('kb:upload.added', { count: res.added_count })]
-          if (res.skipped_count) parts.push(t('kb:upload.skipped', { count: res.skipped_count }))
-          if (res.failed_count) parts.push(t('kb:upload.failed', { count: res.failed_count }))
-          const line = parts.join(' · ')
-          if (res.added_count === 0 && res.failed_count > 0) {
-            // Every file failed — surface the first failure's message so the
-            // user learns WHY (e.g. compile error / missing LLM API key).
-            const reason = res.files.find((f) => f.status === 'failed')?.message
-            toast.error(t('kb:upload.errorToast', { summary: line }) + (reason ? t('kb:upload.reasonSuffix', { reason }) : ''))
-          } else if (res.failed_count > 0) {
-            // Some added, some failed — not a clean success.
-            toast.warning(t('kb:upload.partialToast', { summary: line }))
-          } else if (res.added_count > 0) {
-            toast.success(t('kb:upload.successToast', { summary: line }))
-          } else {
-            // Nothing added or failed (all skipped duplicates) — neutral, not
-            // an error and not a "added" success.
-            toast.info(t('kb:upload.existsToast', { summary: line }))
-          }
-        } else {
-          // Stream ended cleanly but never delivered a `final` summary and no
-          // explicit `error` frame — treat as an interrupted upload so the user
-          // isn't left with a silent no-op.
-          toast.error(t('kb:upload.incompleteToast'))
-        }
-        // Refresh regardless of outcome: a failed compile may still have
-        // written a raw file, and the user needs to see current state.
         await refreshInventory()
       } catch (e) {
-        // An abort (component unmounted / navigated away mid-upload) is a clean
-        // cancel: no toast, no refresh — the component is gone. Real failures
-        // still surface.
-        const aborted = controller.signal.aborted || (e as { name?: string })?.name === 'AbortError'
-        if (!aborted) toast.error(errMsg(e))
+        // Abort = the view detached (unmount/navigation); the job is unaffected
+        // and a later mount re-attaches. Real stream failures surface.
+        if (!controller.signal.aborted) toast.error(errMsg(e))
       } finally {
-        setUploading(false)
+        if (activeJobIdRef.current === jobId) activeJobIdRef.current = null
+        if (!controller.signal.aborted) setUploading(false)
       }
     },
-    [id, uploading, refreshInventory, t],
+    [applyJobEvent, refreshInventory],
   )
+
+  const doUpload = useCallback(
+    async (files: File[]) => {
+      if (files.length === 0 || uploading) return
+      // Seed one row per file so the full set shows immediately, then flip each
+      // to processing/terminal as job events arrive. Rows correlate to events
+      // by array index (event order == files order), NOT by basename, so two
+      // same-basename files from different folders never collide.
+      setUploadFiles(files.map((f) => ({ id: String(rowIdSeq.current++), name: f.name, status: 'pending' as const })))
+      setUploadLogs([])
+      try {
+        // Starts a server-owned job and returns immediately with its id — the
+        // compile no longer blocks on (or dies with) this HTTP request.
+        const accepted = await startUpload(id, files)
+        notifyJobIdRef.current = accepted.job_id
+        await attachJob(accepted.job_id)
+      } catch (e) {
+        setUploadFiles((prev) => prev.map((f) => ({ ...f, status: 'failed' as const })))
+        toast.error(errMsg(e))
+      }
+    },
+    [id, uploading, attachJob],
+  )
+
+  /** Cancel the watched job via the backend (cooperative: the worker stops at
+   *  its next checkpoint and the in-flight mutation rolls back; the `cancelled`
+   *  job event settles the rows and toasts). Closing the tab does NOT cancel —
+   *  the job is server-owned precisely so it survives navigation/refresh. */
+  const cancelUpload = useCallback(() => {
+    const jobId = activeJobIdRef.current
+    if (!jobId) return
+    cancelJob(jobId).catch((e) => toast.error(errMsg(e)))
+  }, [])
+
+  // After a refresh/remount: rediscover this KB's most recent add job and
+  // re-attach — the server kept it running, and its event ring replays the
+  // rows + logs. Past jobs replay silently (toasts only for jobs THIS session
+  // started, via notifyJobIdRef).
+  useEffect(() => {
+    let stale = false
+    listJobs(id)
+      .then((jobs) => {
+        const latest = [...jobs].reverse().find((j) => j.kind === 'add')
+        if (!latest || stale) return
+        setUploadFiles([])
+        setUploadLogs([])
+        notifyJobIdRef.current = null
+        void attachJob(latest.id)
+      })
+      .catch(() => {}) // no jobs yet / server unreachable — nothing to restore
+    return () => {
+      stale = true
+    }
+  }, [id, attachJob])
 
   /** Remove one document via `/api/v1/remove`, then refresh + toast. The
    *  identifier is the document's original filename (`WikiDocument.name`),
@@ -380,13 +457,15 @@ export default function KbDetail() {
   )
 
   // Card selection handler: Index opens index.md, a type card auto-selects
-  // its first page, Documents shows no reader.
+  // its first page, Documents/legal views show no reader.
   const selectSection = useCallback(
     (next: Section) => {
       setSection(next)
       if (next === 'index') {
         openPath('index.md')
-      } else if (next !== 'documents') {
+      } else if (next === 'documents' || next === 'legal-graph' || next === 'lifecycle' || next === 'sync-sources') {
+        setSelectedPath(null)
+      } else {
         const first = inv?.[next]?.[0]
         setSelectedPath(first ? `${next}/${first}` : null)
       }
@@ -450,13 +529,21 @@ export default function KbDetail() {
             invError={invError}
             uploading={uploading}
             uploadFiles={uploadFiles}
+            uploadLogs={uploadLogs}
             dragActive={dragActive}
             fileInputRef={fileInputRef}
             onDragActiveChange={setDragActive}
             onUpload={doUpload}
+            onCancelUpload={cancelUpload}
             onRefresh={refreshInventory}
             onDelete={onDeleteDocument}
           />
+        ) : section === 'legal-graph' ? (
+          <LegalGraphView kb={id} />
+        ) : section === 'lifecycle' ? (
+          <LifecycleView kb={id} />
+        ) : section === 'sync-sources' ? (
+          <SyncSourcesView kb={id} />
         ) : (
           <div className="h-full flex">
             <div className="w-[300px] shrink-0 border-r border-[hsl(var(--glass-border))] glass-2 flex flex-col min-h-0">
@@ -841,6 +928,8 @@ function UploadStatusIcon({ status }: { status: UploadStatus }) {
       return <CircleSlash2 className="w-3.5 h-3.5 text-muted-foreground" />
     case 'failed':
       return <XCircle className="w-3.5 h-3.5 text-red-500 dark:text-red-400" />
+    case 'cancelled':
+      return <Ban className="w-3.5 h-3.5 text-amber-500 dark:text-amber-400" />
     default:
       return <Circle className="w-3.5 h-3.5 text-muted-foreground/50" />
   }
@@ -856,12 +945,118 @@ function UploadStatusIcon({ status }: { status: UploadStatus }) {
  * on close). The body scrolls independently and native find-in-page works (the
  * whole document is rendered, not virtualized). Documents are read-only
  * ingestion artifacts, so there is no edit affordance. */
+/** DocIR structure outline for the reader (UI_INTEGRATION_PLAN §5).
+ *  Fetches the document's DocIR by content hash and renders the recursive
+ *  section tree (part/chapter/section) with visual-node markers; clicking a node that has
+ *  a page jumps the reader to it. Hidden when no DocIR exists for the doc. */
+function DocirOutline({ kb, hash, onJumpPage }: { kb: string; hash: string; onJumpPage: (p: number) => void }) {
+  const { t } = useTranslation('legal')
+  const [open, setOpen] = useState(false)
+  const [root, setRoot] = useState<DocirNode | null>(null)
+  const [loaded, setLoaded] = useState(false)
+  useEffect(() => {
+    let cancelled = false
+    setLoaded(false)
+    setRoot(null)
+    getDocirByHash(kb, hash)
+      .then((r) => {
+        if (!cancelled) setRoot(r.docir?.root ?? null)
+      })
+      .catch(() => {
+        if (!cancelled) setRoot(null)
+      })
+      .finally(() => {
+        if (!cancelled) setLoaded(true)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [kb, hash])
+  if (!loaded || !root) return null
+  const renderNode = (n: DocirNode, depth: number): ReactNode => {
+    const isVisual = n.kind === 'figure_anchor'
+    const page = n.loc?.page ?? null
+    const hasChildren = !!n.children && n.children.length > 0
+    const label = n.title || n.vision?.text_anchor || (isVisual ? n.vision?.type : '') || n.kind
+    return (
+      <div key={n.id} style={{ paddingLeft: depth * 12 }}>
+        <div className="flex items-center gap-1 rounded px-1 py-0.5 hover:bg-[hsl(var(--glass-hover))]">
+          {hasChildren ? (
+            <DocirToggle node={n} depth={depth} renderNode={renderNode} />
+          ) : (
+            <span className="w-3 shrink-0" />
+          )}
+          {isVisual ? (
+            <Eye className="h-3 w-3 shrink-0 text-amber-500" />
+          ) : (
+            <span className="w-3 shrink-0" />
+          )}
+          {page != null ? (
+            <button
+              onClick={() => onJumpPage(page)}
+              className="min-w-0 flex-1 truncate text-left text-[11.5px] text-foreground hover:underline"
+              title={String(label)}
+            >
+              {label}
+              <span className="ml-1 text-[10px] text-muted-foreground">p{page}</span>
+            </button>
+          ) : (
+            <span className="min-w-0 flex-1 truncate text-[11.5px] text-muted-foreground" title={String(label)}>
+              {label}
+            </span>
+          )}
+        </div>
+      </div>
+    )
+  }
+  return (
+    <div className="mb-4 rounded-lg border border-[hsl(var(--glass-border))] bg-muted/20">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-1.5 px-3 py-2 text-left text-[12px] font-semibold text-foreground"
+      >
+        {open ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+        <ListTree className="h-3.5 w-3.5 text-muted-foreground" />
+        {t('reader.structure')}
+      </button>
+      {open && <div className="border-t border-[hsl(var(--glass-border))] px-2 py-2">{renderNode(root, 0)}</div>}
+    </div>
+  )
+}
+
+/** Expand/collapse control for a DocIR node with children (local expand state). */
+function DocirToggle({
+  node,
+  depth,
+  renderNode,
+}: {
+  node: DocirNode
+  depth: number
+  renderNode: (n: DocirNode, d: number) => ReactNode
+}) {
+  const [exp, setExp] = useState(depth < 1)
+  return (
+    <>
+      <button
+        onClick={() => setExp((v) => !v)}
+        className="grid h-3 w-3 shrink-0 place-items-center text-muted-foreground"
+        aria-label={exp ? 'collapse' : 'expand'}
+      >
+        {exp ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+      </button>
+      {exp && node.children?.map((c) => renderNode(c, depth + 1))}
+    </>
+  )
+}
+
 function DocumentReaderDrawer({
   doc,
   body,
   loading,
   error,
   isEmpty,
+  kb,
+  onJumpPage,
   page,
   totalPages,
   onFirst,
@@ -876,6 +1071,8 @@ function DocumentReaderDrawer({
   loading: boolean
   error: string | null
   isEmpty: boolean
+  kb?: string
+  onJumpPage?: (p: number) => void
   page: number
   totalPages: number
   onFirst: () => void
@@ -1030,6 +1227,9 @@ function DocumentReaderDrawer({
                           : t('kb:docs.reader.emptyDoc')}
                       </div>
                     )}
+                    {!loading && !error && !isEmpty && kb && shown?.hash && onJumpPage && (
+                      <DocirOutline kb={kb} hash={shown.hash} onJumpPage={onJumpPage} />
+                    )}
                     {!loading && !error && !isEmpty && (
                       <div className="text-[14px] leading-relaxed text-foreground">{body}</div>
                     )}
@@ -1104,10 +1304,12 @@ function DocumentsPane({
   invError,
   uploading,
   uploadFiles,
+  uploadLogs,
   dragActive,
   fileInputRef,
   onDragActiveChange,
   onUpload,
+  onCancelUpload,
   onRefresh,
   onDelete,
 }: {
@@ -1116,10 +1318,12 @@ function DocumentsPane({
   invError: string | null
   uploading: boolean
   uploadFiles: UploadFileState[]
+  uploadLogs: string[]
   dragActive: boolean
   fileInputRef: RefObject<HTMLInputElement | null>
   onDragActiveChange: (active: boolean) => void
   onUpload: (files: File[]) => void
+  onCancelUpload: () => void
   onRefresh: () => void
   onDelete: (identifier: string) => Promise<void>
 }) {
@@ -1154,6 +1358,11 @@ function DocumentsPane({
     setDocPage(1)
     setDocTotalPages(1)
     setOpenDoc(d)
+  }, [])
+  // Jump the open reader to a specific page (used by the DocIR structure tree).
+  const jumpToPage = useCallback((p: number) => {
+    setDocPage(p)
+    setDocReloadSeq((s) => s + 1)
   }, [])
   const openHash = openDoc?.hash ?? null
 
@@ -1215,6 +1424,14 @@ function DocumentsPane({
       setConfirmName(null)
     }
   }
+
+  // Compile-log panel: pin to the bottom as new lines stream in, so the user
+  // watches live progress without manual scrolling.
+  const logRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const el = logRef.current
+    if (el) el.scrollTop = el.scrollHeight
+  }, [uploadLogs])
   return (
     <>
     <div className="h-full overflow-y-auto scroll-edge-top">
@@ -1270,9 +1487,21 @@ function DocumentsPane({
         {/* Per-file upload progress (streaming /api/v1/add?stream=true) */}
         {uploadFiles.length > 0 && (
           <div className="mt-4">
-            <h2 className="text-[13.5px] font-semibold text-foreground">
-              {t('kb:upload.progressHeading', { count: uploadFiles.length })}
-            </h2>
+            <div className="flex items-center justify-between gap-2">
+              <h2 className="text-[13.5px] font-semibold text-foreground">
+                {t('kb:upload.progressHeading', { count: uploadFiles.length })}
+              </h2>
+              {uploading && (
+                <button
+                  type="button"
+                  onClick={onCancelUpload}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-[hsl(var(--glass-border))] glass-2 px-2.5 py-1 text-[12px] font-medium text-muted-foreground transition-colors hover:text-red-500 hover:border-red-500/40"
+                >
+                  <Ban className="w-3.5 h-3.5" />
+                  {t('kb:upload.cancel')}
+                </button>
+              )}
+            </div>
             <div className="mt-2 space-y-1.5">
               {uploadFiles.map((f) => (
                 <div
@@ -1287,6 +1516,22 @@ function DocumentsPane({
                 </div>
               ))}
             </div>
+            {/* Live compile log streamed from the backend (`log` SSE frames). */}
+            {uploadLogs.length > 0 && (
+              <div className="mt-3">
+                <h3 className="text-[12px] font-medium text-muted-foreground">
+                  {t('kb:upload.logHeading')}
+                </h3>
+                <div
+                  ref={logRef}
+                  className="mt-1.5 max-h-56 overflow-y-auto rounded-xl border border-[hsl(var(--glass-border))] bg-muted/40 px-3 py-2 font-mono text-[11px] leading-relaxed text-muted-foreground"
+                >
+                  {uploadLogs.map((line, i) => (
+                    <div key={i} className="whitespace-pre-wrap break-all">{line}</div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -1399,6 +1644,8 @@ function DocumentsPane({
       loading={docLoading}
       error={docError}
       isEmpty={readerEmpty}
+      kb={kb}
+      onJumpPage={jumpToPage}
       page={docSource?.page ?? docPage}
       totalPages={docSource?.total_pages ?? docTotalPages}
       onFirst={() => setDocPage(1)}

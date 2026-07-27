@@ -17,6 +17,7 @@ export const NAMESPACES = [
   "settings",
   "chat",
   "artifacts",
+  "legal",
 ] as const
 
 void i18n

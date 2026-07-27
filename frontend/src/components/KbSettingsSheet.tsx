@@ -8,6 +8,7 @@ import {
   ShieldCheck, Clock, Radio,
 } from 'lucide-react'
 import { toast } from 'sonner'
+import LegalSettingsSection from '@/components/legal/LegalSettingsSection'
 import { deleteKb, getKbConfig, patchKbConfig, type KbConfig, type ConfigSource } from '@/api/kb'
 import {
   watchStart, watchStop, watchStatus, runRecompile, runLint, type WatchStatus,
@@ -116,6 +117,7 @@ export default function KbSettingsSheet({
 
                 <div className="flex-1 min-h-0 overflow-y-auto scroll-edge-top px-4 py-4 space-y-6">
                   <KbConfigSection kb={kb} />
+                  <LegalSettingsSection kb={kb} />
                   <KbMaintenanceSection kb={kb} open={open} docCount={docCount} onChanged={onChanged} />
                   <KbDangerSection kb={kb} onDeleted={onDeleted} />
                 </div>

@@ -41,45 +41,50 @@ export interface WatchStatus {
 }
 
 /**
- * One event surfaced by a streaming `POST /api/v1/add` (`_stream_add_uploads`).
- * The backend also emits `start` / `uploaded` / `done` frames that carry no
- * per-file UI signal, so they are collapsed away here.
+ * One event surfaced by an add job's SSE stream (`/api/v1/jobs/{id}/events`,
+ * fed by `openkb.api_ingest.run_add_worker`). The backend also emits `start`
+ * / `uploaded` frames that carry no per-file UI signal, so they are collapsed
+ * away here; `done` terminates the stream.
  */
 export type UploadEvent =
   | { type: "file_start"; index: number; original_name: string }
   | { type: "file_done"; index: number; file: AddFileItem }
+  /** Live compile log line captured from the worker thread (`openkb.*`
+   *  loggers) — the UI shows these in the upload log panel. */
+  | { type: "log"; message: string; level: string; logger: string }
   | { type: "final"; result: AddResult }
+  /** The job was cancelled (explicit cancel endpoint); the in-flight mutation
+   *  was rolled back server-side. Emitted instead of `final`. */
+  | { type: "cancelled"; message: string }
   | { type: "error"; message: string }
+  | { type: "done"; status: string }
+
+/** Server-side job snapshot from `GET /api/v1/jobs` (`openkb.jobs.Job.summary`). */
+export interface JobSummary {
+  id: string
+  kind: string
+  kb: string
+  title: string
+  status: "queued" | "running" | "done" | "failed" | "cancelled"
+  created_at: number
+  started_at: number | null
+  finished_at: number | null
+  result: AddResult | null
+  error: string | null
+  last_seq: number
+}
 
 /**
- * Upload documents via multipart `POST /api/v1/add` with `stream=true`, calling
- * `onEvent` as the backend reports per-file progress over SSE.
- *
- * This does NOT go through `apiStream` because the body is `FormData`, not JSON
- * — but the bearer token must still be attached by hand so the request carries
- * `Authorization` when a token is set. The SSE frame parsing mirrors
- * `apiStream` in `client.ts`. Events map to `_stream_add_uploads`:
- *   `file_start` → compile starting for one file,
- *   `file_done`  → that file's `AddFileItem` (status added/skipped/failed),
- *   `final`      → the summary `AddResponse`,
- *   `error`      → a stream-level failure message.
- *
- * The backend emits per-file events strictly in upload order (one `file_start`
- * then one `file_done` per file, `saved_uploads` order == `files` order), so
- * `file_start`/`file_done` carry a running `index` the caller uses to correlate
- * an event to its seeded row by position — robust to duplicate basenames, which
- * name-matching would collide.
- *
- * Pass an optional `signal` to make the upload cancellable — aborting it rejects
- * the in-flight `fetch`/`reader.read()` with an `AbortError` that propagates out
- * (mirrors `apiStream`/`runRecompile`), so navigating away mid-upload cancels it.
+ * Upload documents: multipart `POST /api/v1/add` with `stream=true` starts a
+ * SERVER-OWNED job and returns its id immediately. The compile then runs
+ * independently of this HTTP request — watch it with `streamJobEvents`, and a
+ * page refresh can rediscover it via `listJobs` and re-attach. Returns the
+ * `{ job_id, kb, status }` acceptance payload.
  */
-export async function streamUpload(
+export async function startUpload(
   kb: string,
   files: File[],
-  onEvent: (ev: UploadEvent) => void,
-  signal?: AbortSignal,
-): Promise<void> {
+): Promise<{ job_id: string; kb: string; status: string }> {
   const form = new FormData()
   form.append("kb", kb)
   form.append("stream", "true")
@@ -89,9 +94,8 @@ export async function streamUpload(
     method: "POST",
     headers: token ? { Authorization: `Bearer ${token}` } : {},
     body: form,
-    signal,
   })
-  if (!res.ok || !res.body) {
+  if (!res.ok) {
     let detail = `${res.status} ${res.statusText}`
     try {
       const j = await res.json()
@@ -101,12 +105,59 @@ export async function streamUpload(
     }
     throw new Error(i18n.t("common:errors.uploadFailed", { detail }))
   }
+  return res.json()
+}
+
+export function listJobs(kb: string): Promise<JobSummary[]> {
+  return apiFetch<{ jobs: JobSummary[] }>(`/api/v1/jobs?kb=${encodeURIComponent(kb)}`).then(
+    (r) => r.jobs,
+  )
+}
+
+/**
+ * Request cancellation of a job (`POST /api/v1/jobs/{id}/cancel`). Cooperative:
+ * the worker stops at its next checkpoint and the in-flight wiki mutation is
+ * rolled back. Idempotent — cancelling a finished job reports its status.
+ */
+export function cancelJob(jobId: string): Promise<{ status: string }> {
+  return apiFetch<{ status: string }>(`/api/v1/jobs/${jobId}/cancel`, { body: {} })
+}
+
+/**
+ * Tail one job's SSE event stream, calling `onEvent` per frame. Re-attachable:
+ * frames carry monotonic SSE `id:` cursors; pass `lastSeq` to resume after the
+ * last frame a previous view saw (the server replays its ring buffer). The
+ * stream ends on the job's terminal `done` frame — which is also delivered to
+ * `onEvent` — or when `signal` aborts (aborting only drops THIS view; the job
+ * itself keeps running server-side until it finishes or is explicitly
+ * cancelled via `cancelJob`).
+ *
+ * Per-file events arrive strictly in upload order (one `file_start` then one
+ * `file_done` per file), so they carry a running `index` the caller uses to
+ * correlate events to rows by position — robust to duplicate basenames.
+ */
+export async function streamJobEvents(
+  jobId: string,
+  onEvent: (ev: UploadEvent) => void,
+  signal?: AbortSignal,
+  lastSeq = -1,
+): Promise<void> {
+  const token = getToken()
+  const url =
+    getApiBase().replace(/\/$/, "") +
+    `/api/v1/jobs/${jobId}/events?last_seq=${lastSeq}`
+  const res = await fetch(url, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    signal,
+  })
+  if (!res.ok || !res.body) {
+    throw new Error(i18n.t("common:errors.uploadFailed", { detail: `${res.status}` }))
+  }
 
   const reader = res.body.getReader()
   const decoder = new TextDecoder()
   let buf = ""
-  // Running cursor over the seeded rows: `file_start` advances it, the matching
-  // `file_done` reuses it. See the ordering note above.
+  // Running cursor over the rows: `file_start` advances it, `file_done` reuses.
   let fileCursor = -1
   while (true) {
     const { done, value } = await reader.read()
@@ -118,15 +169,13 @@ export async function streamUpload(
       const lines = block.split("\n")
       const eventLine = lines.find((l) => l.startsWith("event: "))
       const dataLine = lines.find((l) => l.startsWith("data: "))
-      if (!eventLine || !dataLine) continue
+      if (!eventLine || !dataLine) continue // keep-alive comment / malformed
       const event = eventLine.slice("event: ".length)
       let data: any
       try {
         data = JSON.parse(dataLine.slice("data: ".length))
       } catch {
-        // Malformed / non-JSON data frame — skip it like a robust SSE reader
-        // instead of throwing out of the whole read loop.
-        continue
+        continue // robust SSE reader: skip a malformed frame, keep streaming
       }
       switch (event) {
         case "file_start":
@@ -136,13 +185,27 @@ export async function streamUpload(
         case "file_done":
           onEvent({ type: "file_done", index: fileCursor, file: data as AddFileItem })
           break
+        case "log":
+          onEvent({
+            type: "log",
+            message: String(data.message ?? ""),
+            level: String(data.level ?? "info"),
+            logger: String(data.logger ?? ""),
+          })
+          break
+        case "cancelled":
+          onEvent({ type: "cancelled", message: String(data.message ?? "") })
+          break
         case "final":
           onEvent({ type: "final", result: data as AddResult })
           break
         case "error":
           onEvent({ type: "error", message: String(data.message ?? "") })
           break
-        // `start` / `uploaded` / `done` carry no per-file UI signal.
+        case "done":
+          onEvent({ type: "done", status: String(data.status ?? "") })
+          break
+        // `start` / `uploaded` carry no per-file UI signal.
       }
     }
   }

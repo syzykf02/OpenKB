@@ -37,6 +37,7 @@ from openkb.config import (
     get_timeout,
     resolve_entity_types,
 )
+from openkb.ingest_cancel import check_cancelled
 from openkb.lint import list_existing_wiki_targets, strip_ghost_wikilinks
 from openkb.locks import atomic_write_text
 from openkb.schema import INDEX_SEED, get_agents_md
@@ -417,6 +418,9 @@ def _llm_call(
     **kwargs,
 ) -> str:
     """Single LLM call with animated progress and debug logging."""
+    # Cancel checkpoint: every slow step funnels through here, so a cancelled
+    # API ingest stops before the next LLM request (no-op on the CLI path).
+    check_cancelled()
     messages = _prepare_messages(model, messages)
     extra_headers = bundle.extra_headers if bundle is not None else get_extra_headers()
     if extra_headers:
@@ -482,6 +486,9 @@ async def _llm_call_async(
     **kwargs,
 ) -> str:
     """Async LLM call with timing output and debug logging."""
+    # Cancel checkpoint: every slow step funnels through here, so a cancelled
+    # API ingest stops before the next LLM request (no-op on the CLI path).
+    check_cancelled()
     messages = _prepare_messages(model, messages)
     extra_headers = bundle.extra_headers if bundle is not None else get_extra_headers()
     if extra_headers:

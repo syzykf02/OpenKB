@@ -1,0 +1,56 @@
+{
+  "graph": {
+    "title": "法律知识图谱",
+    "allTypes": "全部类型",
+    "allRelations": "全部关系",
+    "nodes": "节点",
+    "empty": "图谱为空。摄取文档后会自动抽取实体与关系。",
+    "selectHint": "选择左侧节点查看影响面分析。",
+    "impact": "影响面",
+    "noImpact": "无节点引用此项。"
+  },
+  "lifecycle": {
+    "title": "知识生命周期",
+    "allStatus": "全部状态",
+    "empty": "暂无知识页面。",
+    "confidence": "置信度",
+    "sources": "来源",
+    "decay": "衰减",
+    "confirm": "确认",
+    "supersede": "取代",
+    "history": "历史",
+    "noHistory": "暂无历史记录。",
+    "supersedePromptBy": "取代「{{page}}」的页面路径:",
+    "supersedePromptReason": "取代原因:",
+    "confirmed": "已确认 {{page}}"
+  },
+  "sync": {
+    "title": "同步源管理",
+    "add": "添加",
+    "added": "已添加源 {{id}}",
+    "empty": "暂无同步源。",
+    "scan": "扫描",
+    "apply": "应用",
+    "idPlaceholder": "源 ID",
+    "pathPlaceholder": "目录路径",
+    "diffTitle": "差异: {{id}}",
+    "newFiles": "新增文件",
+    "modifiedFiles": "修改文件",
+    "deletedFiles": "删除文件"
+  },
+  "reader": {
+    "structure": "文档结构 (DocIR)"
+  },
+  "settings": {
+    "heading": "法律知识库",
+    "enable": "启用法律专业功能",
+    "enableDesc": "开启后,编译时抽取法律实体类型(法规/案例/法院/法官/先例/证据/法理)并注入实体类型清单。",
+    "entityTypes": "法律实体类型",
+    "visionHeading": "视觉分析策略",
+    "visionDesc": "文本优先、视觉兜底:仅当文本无法回答时,才按需渲染候选页调用视觉模型(图表/签名/扫描件)。",
+    "lifecycleHeading": "生命周期衰减速率",
+    "decaySlow": "slow — 架构性知识(案由体系/法规框架),近乎永存",
+    "decayMedium": "medium — 时效性知识(地方审判口径)",
+    "decayFast": "fast — 临时性知识(已被取代的旧规则)"
+  }
+}

@@ -66,7 +66,7 @@ The file `init` writes is small; everything else is optional. This is the shippe
 [`config.yaml.example`](../../config.yaml.example), verbatim:
 
 ```yaml
-model: gpt-5.4                   # LLM model (any LiteLLM-supported provider)
+model: deepseek/deepseek-v4-flash # LLM model (any LiteLLM-supported provider)
 language: en                     # Wiki output language
 pageindex_threshold: 20          # PDF pages threshold for PageIndex
 
@@ -108,7 +108,7 @@ pageindex_threshold: 20          # PDF pages threshold for PageIndex
 
 | Key | Default | What it does |
 | --- | --- | --- |
-| `model` | `gpt-5.4` | LLM used for all compile/query/chat work. |
+| `model` | `deepseek/deepseek-v4-flash` | LLM used for all compile/query/chat work. |
 | `language` | `en` | Language the wiki is written in. |
 | `pageindex_threshold` | `20` | PDFs with this many pages **or more** take the long-doc (PageIndex) path; shorter ones go through the short-doc path. See [`pageindex-cloud/`](../pageindex-cloud/). |
 | `concurrency` | `null` | Caps concurrent LLM calls OpenKB makes during ingest — both PageIndex's indexing of a long document and OpenKB's own concept/entity compilation. The two never run at once for the same document, so one setting covers both. Lower it if you hit provider rate limits or "too many open files" on large PDFs. `null` lets each stage apply its own default. |

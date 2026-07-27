@@ -21,12 +21,16 @@
     "dropzone": "Drop files here, or click to choose",
     "dropzoneHint": "PDF / Word / Markdown / text and more; multi-select supported",
     "progressHeading": "Upload progress · {{count}}",
+    "cancel": "Cancel",
+    "cancelledToast": "Compile cancelled — the in-flight file was rolled back",
+    "logHeading": "Compile log",
     "fileStatus": {
       "pending": "Waiting",
       "processing": "Compiling…",
       "added": "Added",
       "skipped": "Skipped",
-      "failed": "Failed"
+      "failed": "Failed",
+      "cancelled": "Cancelled"
     }
   },
   "docs": {
@@ -96,7 +100,10 @@
     "entities": { "label": "Entities", "caption": "people · orgs" },
     "summaries": { "label": "Summaries", "caption": "per-document" },
     "reports": { "label": "Reports", "caption": "lint · recompile" },
-    "documents": { "label": "Documents", "caption": "compiled docs" }
+    "documents": { "label": "Documents", "caption": "compiled docs" },
+    "legalGraph": { "label": "Graph", "caption": "entities · relations" },
+    "lifecycle": { "label": "Lifecycle", "caption": "confidence · supersede" },
+    "syncSources": { "label": "Sync", "caption": "folders · sync" }
   },
   "pageList": {
     "empty": "No pages of this type yet",

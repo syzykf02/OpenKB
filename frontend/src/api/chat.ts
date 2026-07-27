@@ -351,6 +351,7 @@ export async function* streamChat(
   sessionId: string | null,
   message: string,
   signal?: AbortSignal,
+  legal = false,
 ): AsyncGenerator<SseEvent> {
   yield* apiStream(
     "/api/v1/chat",
@@ -359,6 +360,7 @@ export async function* streamChat(
       session_id: sessionId,
       message,
       stream: true,
+      legal,
     },
     signal,
   )

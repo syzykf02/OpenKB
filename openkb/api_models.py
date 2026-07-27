@@ -24,6 +24,7 @@ class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1)
     session_id: str | None = None
     stream: bool = True
+    legal: bool = False
 
 
 class ChatResponse(BaseModel):

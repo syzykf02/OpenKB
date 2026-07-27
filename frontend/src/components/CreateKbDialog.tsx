@@ -88,8 +88,8 @@ export default function CreateKbDialog({ children }: { children: ReactNode }) {
       <Dialog.Trigger asChild>{children}</Dialog.Trigger>
       <AnimatePresence>
         {open && (
-          <Dialog.Portal forceMount>
-            <Dialog.Overlay asChild forceMount>
+          <Dialog.Portal>
+            <Dialog.Overlay asChild>
               <motion.div
                 className="fixed inset-0 z-50 bg-black/30"
                 initial={{ opacity: 0 }}
@@ -98,14 +98,16 @@ export default function CreateKbDialog({ children }: { children: ReactNode }) {
                 transition={reduce ? { duration: 0.12 } : { duration: 0.2 }}
               />
             </Dialog.Overlay>
-            <div className="fixed inset-0 z-50 grid place-items-center p-4">
-              <Dialog.Content asChild forceMount>
+            <Dialog.Content asChild>
+              <motion.div
+                className="fixed inset-0 z-50 grid place-items-center p-4"
+                initial={reduce ? { opacity: 0 } : { opacity: 0, scale: 0.96, y: 8 }}
+                animate={reduce ? { opacity: 1 } : { opacity: 1, scale: 1, y: 0 }}
+                exit={reduce ? { opacity: 0 } : { opacity: 0, scale: 0.96, y: 8 }}
+                transition={reduce ? { duration: 0.12 } : { type: 'spring', bounce: 0, duration: 0.3 }}
+              >
                 <motion.div
                   className="w-full max-w-[440px] glass border border-[hsl(var(--glass-border))] shadow-glass-lg rounded-apple-lg p-6"
-                  initial={reduce ? { opacity: 0 } : { opacity: 0, scale: 0.96, y: 8 }}
-                  animate={reduce ? { opacity: 1 } : { opacity: 1, scale: 1, y: 0 }}
-                  exit={reduce ? { opacity: 0 } : { opacity: 0, scale: 0.96, y: 8 }}
-                  transition={reduce ? { duration: 0.12 } : { type: 'spring', bounce: 0, duration: 0.3 }}
                 >
                   <Dialog.Title asChild>
                     <h2 className="text-[16px] font-bold text-foreground">{t('common:actions.newKb')}</h2>
@@ -210,8 +212,8 @@ export default function CreateKbDialog({ children }: { children: ReactNode }) {
                     </div>
                   </form>
                 </motion.div>
-              </Dialog.Content>
-            </div>
+              </motion.div>
+            </Dialog.Content>
           </Dialog.Portal>
         )}
       </AnimatePresence>

@@ -34,6 +34,7 @@
   },
   "newSession": "New session",
   "inputPlaceholder": "Ask a follow-up, or type / for commands…",
+  "legalMode": "Legal mode (statute/case retrieval + citation verification)",
   "commands": {
     "paletteHeading": "Commands · generators",
     "deck": { "label": "Generate slides", "desc": "Compile knowledge into a single-file HTML deck" },

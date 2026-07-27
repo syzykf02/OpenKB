@@ -75,6 +75,7 @@ from openkb.indexer import (
     _write_long_doc_artifacts,
     prepare_cloud_import,
 )
+from openkb.async_locks import async_kb_lock
 from openkb.locks import atomic_write_json, atomic_write_text, kb_ingest_lock, kb_read_lock
 from openkb.log import append_log
 from openkb.mutation import publish_staged_tree
@@ -409,31 +410,11 @@ def _snapshot_add_paths(
     final_raw: Path | None,
     final_source: Path | None,
 ) -> list[Path]:
-    # NOTE: .openkb/files (the PageIndex blob store) is intentionally NOT
-    # snapshotted here. It is append-only by {doc_id}, and the doc_id is only
-    # assigned during indexing (after this snapshot). Eagerly snapshotting the
-    # whole tree cost one os.link per existing blob on every add; instead the
-    # long-doc add path registers just the new blob via snapshot.track_new()
-    # once indexing has run.
-    paths = [
-        kb_dir / ".openkb" / "hashes.json",
-        kb_dir / ".openkb" / "pageindex.db",
-        kb_dir / ".openkb" / "pageindex.db-wal",
-        kb_dir / ".openkb" / "pageindex.db-shm",
-        kb_dir / ".openkb" / "pageindex.db-journal",
-        kb_dir / "wiki" / "summaries" / f"{doc_name}.md",
-        kb_dir / "wiki" / "sources" / f"{doc_name}.json",
-        kb_dir / "wiki" / "sources" / "images" / doc_name,
-        kb_dir / "wiki" / "concepts",
-        kb_dir / "wiki" / "entities",
-        kb_dir / "wiki" / "index.md",
-        kb_dir / "wiki" / "log.md",
-    ]
-    if final_raw is not None:
-        paths.append(final_raw)
-    if final_source is not None:
-        paths.append(final_source)
-    return paths
+    # Thin delegate to openkb.add_coordinator (the canonical home for mutation
+    # path management). Kept as a local alias so call sites read naturally.
+    from openkb.add_coordinator import snapshot_add_paths
+
+    return snapshot_add_paths(kb_dir, doc_name, final_raw, final_source)
 
 
 def _run_compile_with_retry(coro_factory, label: str) -> None:
@@ -619,6 +600,7 @@ def _add_single_file_locked(
         append_log(kb_dir / "wiki", "ingest", file_path.name)
 
     from openkb.add_coordinator import AddMutationPlan, run_add_mutation
+    from openkb.legal.ingest_hooks import make_ingest_hook
 
     plan = AddMutationPlan(
         operation="add",
@@ -629,7 +611,7 @@ def _add_single_file_locked(
         },
         touched_paths=_snapshot_add_paths(kb_dir, doc_name, final_raw, final_source),
         body=commit_body,
-        post_commit_hooks=[append_ingest_log],
+        post_commit_hooks=[append_ingest_log, make_ingest_hook(kb_dir, doc_name)],
         hardlink_dirs={
             kb_dir / "wiki" / "concepts",
             kb_dir / "wiki" / "entities",
@@ -1305,7 +1287,7 @@ def _cleanup_pageindex(
 
     _setup_llm_key(kb_dir)
     config = resolve_effective_config(kb_dir)[0]
-    model = config.get("model", DEFAULT_CONFIG.get("model", "gpt-5.4"))
+    model = config.get("model", DEFAULT_CONFIG.get("model", "deepseek/deepseek-v4-flash"))
     client = PageIndexClient(model=model, storage_path=str(openkb_dir))
     col = client.collection()
 
@@ -2082,11 +2064,14 @@ async def iter_recompile(
     Terminal errors yield an ``error`` event carrying an HTTP-mapped ``code``:
     400 (bad args), 404 (not found / empty registry), 409 (multiple).
 
-    The whole resolve + compile span runs under ``kb_ingest_lock`` (matching
-    the CLI's ``@_with_kb_lock(exclusive=True)``). Compile calls are awaited on
-    the caller's event loop instead of ``asyncio.run``, so this is safe inside
-    an async FastAPI endpoint. Reference ``compiler`` via the module so tests
-    can patch ``openkb.agent.compiler.compile_*`` and see the call.
+    The whole resolve + compile span runs under the KB ingest lock (matching
+    the CLI's ``@_with_kb_lock(exclusive=True)``), acquired via the
+    ``async_kb_lock`` bridge so the blocking flock wait happens OFF the event
+    loop — a recompile waiting behind a long compile must not freeze every
+    other request the server handles. Compile calls are awaited on the
+    caller's event loop instead of ``asyncio.run``, so this is safe inside an
+    async FastAPI endpoint. Reference ``compiler`` via the module so tests can
+    patch ``openkb.agent.compiler.compile_*`` and see the call.
     """
     from openkb.state import HashRegistry
 
@@ -2097,7 +2082,7 @@ async def iter_recompile(
     def _classify(meta: dict) -> str:
         return "long" if _is_long_doc(meta) else "short"
 
-    with kb_ingest_lock(openkb_dir):
+    async with async_kb_lock(openkb_dir, exclusive=True):
         # --- validate args ---
         if all_docs and doc_name:
             yield {
@@ -3571,7 +3556,7 @@ def initialize_kb(
     # Seed config.yaml: an explicit model wins; otherwise inherit the
     # operator's project-root config.yaml (model/language/optional blocks)
     # so a KB created via the REST UI matches the deployed setup instead of
-    # the hardcoded DEFAULT_CONFIG (gpt-5.4 / en). Defaults are the last resort.
+    # the hardcoded DEFAULT_CONFIG (deepseek/deepseek-v4-flash / en). Defaults are the last resort.
     template_config = Path.cwd() / "config.yaml"
     if model is not None:
         config = {
@@ -3735,7 +3720,9 @@ async def run_lint_report(
     lint_files_changed: int | None = None
     lint_ghosts_removed: int | None = None
     if fix:
-        with kb_ingest_lock(kb_dir / ".openkb"):
+        # Off-loop lock bridge: waiting behind a compile must not freeze the
+        # event loop (this coroutine runs on it under the REST API).
+        async with async_kb_lock(kb_dir / ".openkb", exclusive=True):
             files_changed, ghosts = fix_broken_links(kb_dir / "wiki")
         lint_files_changed = files_changed
         lint_ghosts_removed = ghosts
@@ -3816,3 +3803,20 @@ async def run_lint_report(
         "lint_files_changed": lint_files_changed,
         "lint_ghosts_removed": lint_ghosts_removed,
     }
+
+
+# Register the legal lifecycle command group (logic in openkb.legal.lifecycle_cli
+# so this grandfathered module does not grow with new feature code).
+from openkb.legal.lifecycle_cli import lifecycle as _lifecycle_group  # noqa: E402
+
+cli.add_command(_lifecycle_group)
+
+# Register the sync command group (logic in openkb.sync.sync_cli).
+from openkb.sync.sync_cli import sync as _sync_group  # noqa: E402
+
+cli.add_command(_sync_group)
+
+# Register the collaboration command group (logic in openkb.legal.collab_cli).
+from openkb.legal.collab_cli import collab as _collab_group  # noqa: E402
+
+cli.add_command(_collab_group)

@@ -13,7 +13,7 @@ AGENTS.md covers install / test / lint. A few more:
 
 - **Run a single test:** `pytest tests/test_compiler.py::test_name`, or filter with `pytest tests/test_compiler.py -k pattern`.
 - **API server + Knowledge Workbench (Web UI):** install the extra (`pip install -e ".[dev,web]"`), then `openkb-web` (alias: `openkb-api`, or `python -m openkb.api`) serves the REST API and bundled UI at `http://127.0.0.1:7566/`. Auth is off by default; set `OPENKB_API_TOKEN` to require a bearer token.
-- **Frontend dev:** `cd frontend && npm install && npm run dev` runs the Vite dev server, which proxies `/api` to a running `openkb-web`. `npm run build` regenerates the bundled `openkb/web/` that ships in the wheel.
+- **Frontend dev:** `cd frontend && pnpm install && pnpm run dev` runs the Vite dev server, which proxies `/api` to a running `openkb-web`. `pnpm run build` regenerates the bundled `openkb/web/` that ships in the wheel.
 - **File-size gate:** `tests/test_file_size.py` enforces the <800-line module limit. `cli.py`, `agent/compiler.py`, and `agent/chat.py` are grandfathered - don't add net-new lines to them; split a focused unit out instead.
 
 ## Architecture: the compile pipeline

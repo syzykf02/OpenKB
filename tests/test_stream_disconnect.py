@@ -1,17 +1,20 @@
 """Regression: recompile/deck/skill SSE streams must cooperatively stop on
-client disconnect and release the per-KB mutation lock.
+client disconnect.
 
 Before the fix these three helpers took no ``Request`` and never polled
 ``is_disconnected()``, so an aborting client (frontend Stop / navigate-away /
-sheet-close) left the server running the whole LLM generation while still
-holding ``_kb_mutation_lock``. ``_stream_chat`` / ``_stream_query`` already
-poll the request between events; these tests confirm the three mutation
-streams now do the same.
+sheet-close) left the server running the whole LLM generation. ``_stream_chat``
+/ ``_stream_query`` already poll the request between events; these tests
+confirm the three generation streams now do the same.
+
+Recompile no longer holds an asyncio lock (its KB serialization moved to the
+portalocker ingest lock acquired off-loop — see ``openkb.async_locks``), while
+deck/skill still hold a per-KB generation lock for the stream's lifetime, so
+their tests additionally assert the lock is released when the generator exits.
 
 Each test drives a helper directly with a fake ``Request`` whose
 ``is_disconnected()`` returns True and asserts the stream stops early (does not
-forward the terminal event) and that the ``asyncio.Lock`` it holds is released
-when the generator exits. Mirrors ``test_watch_events_disconnect_terminates``.
+forward the terminal event). Mirrors ``test_watch_events_disconnect_terminates``.
 """
 
 from __future__ import annotations
@@ -48,7 +51,7 @@ def _event_names(frames: list[str]) -> list[str]:
     return names
 
 
-def test_recompile_stream_stops_and_releases_lock_on_disconnect(monkeypatch):
+def test_recompile_stream_stops_on_disconnect(monkeypatch):
     consumed = 0
 
     async def fake_iter_recompile(kb_dir, doc_name, **kwargs):
@@ -63,20 +66,17 @@ def test_recompile_stream_stops_and_releases_lock_on_disconnect(monkeypatch):
 
     monkeypatch.setattr(api_helpers, "iter_recompile", fake_iter_recompile)
 
-    lock = asyncio.Lock()
     request = RecompileRequest(kb="k", all_docs=True)
-    frames = _drain(_stream_recompile(request, Path("."), lock, _fake_request(True), bundle=None))
+    frames = _drain(_stream_recompile(request, Path("."), _fake_request(True), bundle=None))
 
     names = _event_names(frames)
     # Breaks at the top of the loop, so no plan/doc/final is forwarded.
     assert names == ["start", "done"]
     # The disconnect is caught before draining the recompile generator.
     assert consumed == 1
-    # The generator exited, so ``async with mutation_lock`` released the lock.
-    assert not lock.locked()
 
 
-def test_recompile_stream_completes_and_releases_lock_when_connected(monkeypatch):
+def test_recompile_stream_completes_when_connected(monkeypatch):
     """Control: the added poll must not break a normal (connected) run."""
 
     async def fake_iter_recompile(kb_dir, doc_name, **kwargs):
@@ -86,13 +86,11 @@ def test_recompile_stream_completes_and_releases_lock_when_connected(monkeypatch
 
     monkeypatch.setattr(api_helpers, "iter_recompile", fake_iter_recompile)
 
-    lock = asyncio.Lock()
     request = RecompileRequest(kb="k", all_docs=True)
-    frames = _drain(_stream_recompile(request, Path("."), lock, _fake_request(False), bundle=None))
+    frames = _drain(_stream_recompile(request, Path("."), _fake_request(False), bundle=None))
 
     names = _event_names(frames)
     assert names == ["start", "plan", "doc", "final", "done"]
-    assert not lock.locked()
 
 
 def test_deck_stream_stops_and_releases_lock_on_disconnect(monkeypatch):
