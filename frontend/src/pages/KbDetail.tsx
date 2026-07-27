@@ -784,34 +784,47 @@ function DocirOutline({ kb, hash, onJumpPage }: { kb: string; hash: string; onJu
     const page = n.loc?.page ?? null
     const hasChildren = !!n.children && n.children.length > 0
     const label = n.title || n.vision?.text_anchor || (isVisual ? n.vision?.type : '') || n.kind
+    if (hasChildren) {
+      return (
+        <DocirToggle
+          key={n.id}
+          node={n}
+          depth={depth}
+          isVisual={isVisual}
+          page={page}
+          label={label}
+          onJumpPage={onJumpPage}
+          renderNode={renderNode}
+        />
+      )
+    }
+    // Leaf: a single row indented by depth. No toggle, no children.
     return (
-      <div key={n.id} style={{ paddingLeft: depth * 12 }}>
-        <div className="flex items-center gap-1 rounded px-1 py-0.5 hover:bg-[hsl(var(--glass-hover))]">
-          {hasChildren ? (
-            <DocirToggle node={n} depth={depth} renderNode={renderNode} />
-          ) : (
-            <span className="w-3 shrink-0" />
-          )}
-          {isVisual ? (
-            <Eye className="h-3 w-3 shrink-0 text-amber-500" />
-          ) : (
-            <span className="w-3 shrink-0" />
-          )}
-          {page != null ? (
-            <button
-              onClick={() => onJumpPage(page)}
-              className="min-w-0 flex-1 truncate text-left text-[11.5px] text-foreground hover:underline"
-              title={String(label)}
-            >
-              {label}
-              <span className="ml-1 text-[10px] text-muted-foreground">p{page}</span>
-            </button>
-          ) : (
-            <span className="min-w-0 flex-1 truncate text-[11.5px] text-muted-foreground" title={String(label)}>
-              {label}
-            </span>
-          )}
-        </div>
+      <div
+        key={n.id}
+        className="flex items-center gap-1 rounded px-1 py-0.5 hover:bg-[hsl(var(--glass-hover))]"
+        style={{ paddingLeft: depth * 12 }}
+      >
+        <span className="w-3 shrink-0" />
+        {isVisual ? (
+          <Eye className="h-3 w-3 shrink-0 text-amber-500" />
+        ) : (
+          <span className="w-3 shrink-0" />
+        )}
+        {page != null ? (
+          <button
+            onClick={() => onJumpPage(page)}
+            className="min-w-0 flex-1 truncate text-left text-[11.5px] text-foreground hover:underline"
+            title={String(label)}
+          >
+            {label}
+            <span className="ml-1 text-[10px] text-muted-foreground">p{page}</span>
+          </button>
+        ) : (
+          <span className="min-w-0 flex-1 truncate text-[11.5px] text-muted-foreground" title={String(label)}>
+            {label}
+          </span>
+        )}
       </div>
     )
   }
@@ -830,28 +843,63 @@ function DocirOutline({ kb, hash, onJumpPage }: { kb: string; hash: string; onJu
   )
 }
 
-/** Expand/collapse control for a DocIR node with children (local expand state). */
+/** Expandable node with children: renders its own row, then stacks descendants
+ *  vertically below it. Children MUST be siblings of the row (block flow), not
+ *  nested inside the row's flex container - otherwise they lay out horizontally
+ *  beside the toggle instead of dropping down as a sub-tree. */
 function DocirToggle({
   node,
   depth,
+  isVisual,
+  page,
+  label,
+  onJumpPage,
   renderNode,
 }: {
   node: DocirNode
   depth: number
+  isVisual: boolean
+  page: number | null
+  label: string
+  onJumpPage: (p: number) => void
   renderNode: (n: DocirNode, d: number) => ReactNode
 }) {
   const [exp, setExp] = useState(depth < 1)
   return (
-    <>
-      <button
-        onClick={() => setExp((v) => !v)}
-        className="grid h-3 w-3 shrink-0 place-items-center text-muted-foreground"
-        aria-label={exp ? 'collapse' : 'expand'}
+    <div>
+      <div
+        className="flex items-center gap-1 rounded px-1 py-0.5 hover:bg-[hsl(var(--glass-hover))]"
+        style={{ paddingLeft: depth * 12 }}
       >
-        {exp ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
-      </button>
+        <button
+          onClick={() => setExp((v) => !v)}
+          className="grid h-3 w-3 shrink-0 place-items-center text-muted-foreground"
+          aria-label={exp ? 'collapse' : 'expand'}
+        >
+          {exp ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+        </button>
+        {isVisual ? (
+          <Eye className="h-3 w-3 shrink-0 text-amber-500" />
+        ) : (
+          <span className="w-3 shrink-0" />
+        )}
+        {page != null ? (
+          <button
+            onClick={() => onJumpPage(page)}
+            className="min-w-0 flex-1 truncate text-left text-[11.5px] text-foreground hover:underline"
+            title={String(label)}
+          >
+            {label}
+            <span className="ml-1 text-[10px] text-muted-foreground">p{page}</span>
+          </button>
+        ) : (
+          <span className="min-w-0 flex-1 truncate text-[11.5px] text-muted-foreground" title={String(label)}>
+            {label}
+          </span>
+        )}
+      </div>
       {exp && node.children?.map((c) => renderNode(c, depth + 1))}
-    </>
+    </div>
   )
 }
 
