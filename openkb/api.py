@@ -7,6 +7,7 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import litellm
@@ -68,6 +69,7 @@ from openkb.api_models import (
     ChatSessionListResponse,
     ChatSessionLoadRequest,
     ChatSessionLoadResponse,
+    CompilePendingDocumentRequest,
     DeckListResponse,
     DeckRequest,
     DeckResponse,
@@ -98,6 +100,7 @@ from openkb.api_models import (
 from openkb.api_output import output_router
 from openkb.api_pages_router import pages_router
 from openkb.cli import (
+    SUPPORTED_EXTENSIONS,
     get_kb_list,
     get_kb_status,
     iter_recompile,
@@ -112,10 +115,25 @@ from openkb.config import (
     validate_kb_name,
 )
 from openkb.jobs import JobRegistry
+from openkb.locks import kb_ingest_lock
 from openkb.log import append_log
 from openkb.watch_service import WatchRegistry
 
 logger = logging.getLogger(__name__)
+
+
+def _delete_pending_raw_source(kb_dir: Path, raw_name: str) -> bool:
+    """Delete one source only while it is still classified as pending.
+
+    The ingest lock prevents a compiler from registering or reading the same
+    raw file between the pending check and unlink.
+    """
+    with kb_ingest_lock(kb_dir / ".openkb"):
+        pending_names = {item["path"] for item in get_kb_list(kb_dir)["pending_documents"]}
+        if raw_name not in pending_names:
+            return False
+        (kb_dir / "raw" / raw_name).unlink()
+        return True
 
 
 def create_app() -> FastAPI:
@@ -432,6 +450,42 @@ def create_app() -> FastAPI:
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"List failed: {exc}",
             ) from exc
+
+    @app.post("/api/v1/documents/compile")
+    async def compile_pending_document_endpoint(
+        request: CompilePendingDocumentRequest,
+        _: None = Depends(require_bearer_token),
+    ) -> dict[str, str]:
+        """Resume compilation of one raw source that is already on disk."""
+        kb_dir = _resolve_kb(request.kb)
+        # The UI receives a raw basename from `/list`; reject directories and
+        # traversal rather than letting user input address arbitrary local files.
+        raw_name = Path(request.path).name
+        if raw_name != request.path:
+            raise HTTPException(status_code=400, detail="Invalid raw source path.")
+        raw_path = kb_dir / "raw" / raw_name
+        if not raw_path.is_file():
+            raise HTTPException(status_code=404, detail="Uploaded source not found.")
+        if raw_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            raise HTTPException(status_code=400, detail="Unsupported source type.")
+        bundle = resolve_credential_bundle(kb_dir)
+        job = start_add_job(app_jobs, request.kb, kb_dir, [(raw_path, raw_name)], bundle=bundle)
+        return {"job_id": job.id, "kb": request.kb, "status": job.status}
+
+    @app.post("/api/v1/documents/pending/delete")
+    async def delete_pending_document_endpoint(
+        request: CompilePendingDocumentRequest,
+        _: None = Depends(require_bearer_token),
+    ) -> dict[str, str]:
+        """Remove one uploaded source that has not been compiled yet."""
+        kb_dir = _resolve_kb(request.kb)
+        raw_name = Path(request.path).name
+        if raw_name != request.path:
+            raise HTTPException(status_code=400, detail="Invalid raw source path.")
+        deleted = await run_in_threadpool(_delete_pending_raw_source, kb_dir, raw_name)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Pending uploaded source not found.")
+        return {"status": "deleted", "name": raw_name}
 
     @app.post("/api/v1/status", response_model=StatusResponse)
     async def status_endpoint(

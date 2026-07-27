@@ -759,8 +759,11 @@ def test_add_endpoint_starts_job_and_replays_its_events(monkeypatch, kb_dir):
         names = [e["event"] for e in events]
         assert names[0] == "start" and names[-2:] == ["final", "done"]
         assert "uploaded" in names and "file_start" in names and "file_done" in names
-        assert names.count("file_progress") == 2
-        assert names.count("log") >= 2
+        assert names.count("file_progress") == 3
+        assert names.count("log") >= 4
+        logs = [event["data"]["message"] for event in events if event["event"] == "log"]
+        assert any("Received paper.md" in message for message in logs)
+        assert any("Batch complete" in message for message in logs)
         assert events[0]["data"]["kb"] == kb
         # Frames carry monotonic SSE ids (the re-attach cursor).
         assert [e["id"] for e in events] == list(range(len(events)))
@@ -950,6 +953,121 @@ def test_list_endpoint_includes_entities(monkeypatch, kb_dir):
 
     assert response.status_code == 200
     assert response.json()["entities"] == ["anthropic", "nvidia"]
+
+
+def test_list_includes_uploaded_uncompiled_sources_and_can_resume_them(monkeypatch, kb_dir):
+    """Raw files without a registry entry remain visible and compilable."""
+    client = _client(monkeypatch)
+    kb = _use_named_kb(monkeypatch, kb_dir)
+    raw = kb_dir / "raw" / "waiting.md"
+    raw.write_text("# Waiting", encoding="utf-8")
+    # Legacy registry entries may not have raw_path/path. Their same-named raw
+    # artifact is already compiled and must not also appear as pending.
+    (kb_dir / "raw" / "2605.15184v1.pdf").write_bytes(b"%PDF")
+    (kb_dir / ".openkb" / "hashes.json").write_text(
+        json.dumps(
+            {
+                "compiled-hash": {
+                    "name": "2605.15184v1.pdf",
+                    "type": "pdf",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    listed = client.post("/api/v1/list", json={"kb": kb}, headers=_auth())
+    assert listed.status_code == 200
+    assert listed.json()["pending_documents"] == [
+        {
+            "path": "waiting.md",
+            "name": "waiting.md",
+            "type": "md",
+            "display_type": "short",
+            "size_bytes": len("# Waiting"),
+        }
+    ]
+
+    from openkb.cli import AddFileResult
+
+    def fake_add(path, target_kb, **kwargs):
+        assert path == raw
+        assert target_kb == kb_dir
+        return AddFileResult(path.name, str(path), "added", "compiled")
+
+    monkeypatch.setattr("openkb.api_helpers._add_for_api", fake_add)
+    with client:
+        response = client.post(
+            "/api/v1/documents/compile",
+            json={"kb": kb, "path": "waiting.md"},
+            headers=_auth(),
+        )
+        assert response.status_code == 200
+        job = _wait_for_job(client, response.json()["job_id"])
+        assert job["status"] == "done"
+
+
+def test_compile_pending_document_rejects_path_traversal(monkeypatch, kb_dir):
+    client = _client(monkeypatch)
+    kb = _use_named_kb(monkeypatch, kb_dir)
+
+    response = client.post(
+        "/api/v1/documents/compile",
+        json={"kb": kb, "path": "../outside.md"},
+        headers=_auth(),
+    )
+
+    assert response.status_code == 400
+
+
+def test_delete_pending_document_removes_only_uncompiled_raw_source(monkeypatch, kb_dir):
+    client = _client(monkeypatch)
+    kb = _use_named_kb(monkeypatch, kb_dir)
+    pending = kb_dir / "raw" / "waiting.md"
+    compiled = kb_dir / "raw" / "2605.15184v1.pdf"
+    pending.write_text("# Waiting", encoding="utf-8")
+    compiled.write_bytes(b"%PDF")
+    (kb_dir / ".openkb" / "hashes.json").write_text(
+        json.dumps(
+            {
+                "compiled-hash": {
+                    "name": compiled.name,
+                    "type": "pdf",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    deleted = client.post(
+        "/api/v1/documents/pending/delete",
+        json={"kb": kb, "path": pending.name},
+        headers=_auth(),
+    )
+    protected = client.post(
+        "/api/v1/documents/pending/delete",
+        json={"kb": kb, "path": compiled.name},
+        headers=_auth(),
+    )
+
+    assert deleted.status_code == 200
+    assert deleted.json() == {"status": "deleted", "name": pending.name}
+    assert not pending.exists()
+    assert protected.status_code == 404
+    assert compiled.exists()
+
+
+def test_delete_pending_document_rejects_path_traversal(monkeypatch, kb_dir):
+    client = _client(monkeypatch)
+    kb = _use_named_kb(monkeypatch, kb_dir)
+
+    response = client.post(
+        "/api/v1/documents/pending/delete",
+        json={"kb": kb, "path": "../outside.md"},
+        headers=_auth(),
+    )
+
+    assert response.status_code == 400
 
 
 def test_status_endpoint_returns_structured_counts(monkeypatch, kb_dir):

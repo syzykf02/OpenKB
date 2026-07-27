@@ -3,11 +3,10 @@ import { useNavigate, useParams } from 'react-router'
 import { useTranslation } from 'react-i18next'
 import * as Dialog from '@radix-ui/react-dialog'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
-import { Cloud, FileText, FolderOpen, Link2, ListChecks, Loader2, Pencil, Plus, Upload, RefreshCw, Settings2, Trash2, X, BookOpen, ChevronLeft, ChevronRight, ChevronDown, ChevronsLeft, ChevronsRight, Eye, ListTree, type LucideIcon } from 'lucide-react'
+import { Cloud, ChevronDown, ChevronLeft, ChevronRight, Eye, FileText, Link2, ListChecks, ListTree, Loader2, Pencil, Plus, RefreshCw, Upload, Settings2, Trash2, X, type LucideIcon } from 'lucide-react'
 import { toast } from 'sonner'
-import { deletePage, editPage, getDocumentSource, getKbInventory, getPage, getPageLinks, type DocumentSource, type KbInventory, type WikiDocument } from '@/api/wiki'
+import { deletePage, editPage, getDocumentSource, getKbInventory, getPage, getPageLinks, type DocumentSource, type KbInventory, type PendingDocument, type WikiDocument } from '@/api/wiki'
 import { getDocirByHash, type DocirNode } from '@/api/legal'
-import { removeDocument } from '@/api/maintenance'
 import { ApiError } from '@/api/client'
 import MarkdownView from '@/components/MarkdownView'
 import PageList from '@/components/PageList'
@@ -22,6 +21,17 @@ import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useJobs, type CompileTaskFile, type UploadLogLine } from '@/hooks/useJobs'
 import { useAnimatedSwitch } from '@/hooks/useAnimatedSwitch'
 import { cn } from '@/lib/utils'
+import { deletePendingDocument, removeDocument, runRecompile } from '@/api/maintenance'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 
 /** True when `line` looks like a line of a YAML frontmatter block: a blank line,
  *  a `#` comment, a `- ` list item, an indented continuation, or a `key: value`
@@ -222,6 +232,40 @@ export default function KbDetail() {
     [refreshInventory],
   )
 
+  /** Remove an ingested source, then reconcile the wiki inventory. The API
+   * resolves original filenames exactly before falling back to fuzzy matching,
+   * so a source row's `name` is the safest identifier to send. */
+  const onDeleteDocument = useCallback(
+    async (identifier: string) => {
+      try {
+        const result = await removeDocument(id, identifier)
+        if (result.status === 'partial') {
+          const reason = result.pageindex_error || result.message || ''
+          toast.warning(
+            t('kb:docs.delete.partial', { name: result.name || identifier }) +
+              (reason ? t('kb:docs.delete.reasonSuffix', { reason }) : ''),
+          )
+        } else {
+          toast.success(t('kb:docs.delete.success', { name: result.name || identifier }))
+        }
+        await refreshInventory()
+      } catch (cause) {
+        const detail =
+          cause instanceof ApiError
+            ? (cause.detail as { message?: string; candidates?: Array<{ name?: string; doc_name?: string }> } | undefined)
+            : undefined
+        const candidates = detail?.candidates
+        if (candidates?.length) {
+          const names = candidates.map((candidate) => candidate.name || candidate.doc_name || '?').join(', ')
+          toast.error(t('kb:docs.delete.multiple', { message: detail?.message || errMsg(cause), names }))
+        } else {
+          toast.error(t('kb:docs.delete.error', { error: errMsg(cause) }))
+        }
+      }
+    },
+    [id, refreshInventory, t],
+  )
+
   // Compile-jobs engine: polls `listJobs`, tails the selected job's SSE stream
   // (re-attachable - a refresh or a click on an old job replays its rows + log
   // from the server's event ring), and dedups uploads by SHA-256 against the
@@ -232,50 +276,6 @@ export default function KbDetail() {
     onCompleted: refreshInventory,
   })
 
-
-  /** Remove one document via `/api/v1/remove`, then refresh + toast. The
-   *  identifier is the document's original filename (`WikiDocument.name`),
-   *  which the backend resolves by exact-name match first. `/api/v1/remove`
-   *  returns HTTP 200 for both `removed` (full success) and `partial` (local
-   *  files gone, PageIndex cleanup failed), so success is claimed ONLY on
-   *  `removed`; `partial` warns and surfaces the PageIndex error. A 409
-   *  multiple-match carries a structured `{ message, candidates }` detail — its
-   *  candidate names are shown so the user can disambiguate. */
-  const onDeleteDocument = useCallback(
-    async (identifier: string) => {
-      try {
-        const res = await removeDocument(id, identifier)
-        if (res.status === 'partial') {
-          // HTTP 200, but PageIndex cleanup failed: local wiki files were removed
-          // while the remote index was not. Warn (not success) and say why.
-          const reason = res.pageindex_error || res.message || ''
-          toast.warning(
-            t('kb:docs.delete.partial', { name: res.name || identifier }) +
-              (reason ? t('kb:docs.delete.reasonSuffix', { reason }) : ''),
-          )
-        } else {
-          toast.success(t('kb:docs.delete.success', { name: res.name || identifier }))
-        }
-        await refreshInventory()
-      } catch (e) {
-        // A 409 multiple-match carries a structured detail `{ message, candidates }`
-        // (see client.ts `ApiError.detail`); show the message + candidate names so
-        // the user can pick a more specific identifier, instead of a raw JSON blob.
-        const detail =
-          e instanceof ApiError
-            ? (e.detail as { message?: string; candidates?: Array<{ name?: string; doc_name?: string }> } | undefined)
-            : undefined
-        const candidates = detail?.candidates
-        if (candidates && candidates.length > 0) {
-          const names = candidates.map((c) => c.name || c.doc_name || '?').join(', ')
-          toast.error(t('kb:docs.delete.multiple', { message: detail?.message || errMsg(e), names }))
-        } else {
-          toast.error(t('kb:docs.delete.error', { error: errMsg(e) }))
-        }
-      }
-    },
-    [id, refreshInventory, t],
-  )
 
   // Card selection handler: Index opens index.md, a type card auto-selects
   // its first page, Documents/legal views show no reader.
@@ -296,6 +296,7 @@ export default function KbDetail() {
 
   const docCount = inv?.document_count ?? 0
   const documents = inv?.documents ?? []
+  const pendingDocuments = inv?.pending_documents ?? []
   const hasPages = inv ? pageTotal(inv) > 0 : false
 
   return (
@@ -347,20 +348,20 @@ export default function KbDetail() {
           <DocumentsPane
             kb={id}
             documents={documents}
-            invError={invError}
+            pendingDocuments={pendingDocuments}
             uploading={jobs.uploading}
             dragActive={dragActive}
             fileInputRef={fileInputRef}
             onDragActiveChange={setDragActive}
             onUpload={jobs.doUpload}
-            onCancelUpload={jobs.cancelUpload}
             onRefresh={refreshInventory}
             onDelete={onDeleteDocument}
             taskFiles={jobs.taskFiles}
             selectedLogs={jobs.selectedLogs}
-            selectedRunning={jobs.selectedRunning}
-            selectedCancelling={jobs.selectedCancelling}
+            cancellingJobIds={jobs.cancellingJobIds}
+            onCancelFile={jobs.cancelFile}
             onRetryFile={jobs.retryFile}
+            onCompilePendingFile={jobs.compilePendingFile}
           />
         ) : section === 'legal-graph' ? (
           <LegalGraphView kb={id} />
@@ -741,420 +742,11 @@ function IndexReader(props: ReaderProps) {
   )
 }
 
-/** Read-only slide-out reader for a document's converted source text.
- *
- * Presentational: the parent (DocumentsPane) owns the fetch, per-hash cache,
- * and memoized body, so this can unmount on close (Radix Dialog) yet re-open
- * instantly with un-reparsed Markdown. Radix Dialog supplies the modal a11y —
- * focus trap, initial + return focus, Escape, and background inert — and
- * `shown` keeps the last doc rendered through the exit animation (doc goes null
- * on close). The body scrolls independently and native find-in-page works (the
- * whole document is rendered, not virtualized). Documents are read-only
- * ingestion artifacts, so there is no edit affordance. */
-/** DocIR structure outline for the reader (UI_INTEGRATION_PLAN §5).
- *  Fetches the document's DocIR by content hash and renders the recursive
- *  section tree (part/chapter/section) with visual-node markers; clicking a node that has
- *  a page jumps the reader to it. Hidden when no DocIR exists for the doc. */
-function DocirOutline({ kb, hash, onJumpPage }: { kb: string; hash: string; onJumpPage: (p: number) => void }) {
-  const { t } = useTranslation('legal')
-  const [open, setOpen] = useState(false)
-  const [root, setRoot] = useState<DocirNode | null>(null)
-  const [loaded, setLoaded] = useState(false)
-  useEffect(() => {
-    let cancelled = false
-    setLoaded(false)
-    setRoot(null)
-    getDocirByHash(kb, hash)
-      .then((r) => {
-        if (!cancelled) setRoot(r.docir?.root ?? null)
-      })
-      .catch(() => {
-        if (!cancelled) setRoot(null)
-      })
-      .finally(() => {
-        if (!cancelled) setLoaded(true)
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [kb, hash])
-  if (!loaded || !root) return null
-  const renderNode = (n: DocirNode, depth: number): ReactNode => {
-    const isVisual = n.kind === 'figure_anchor'
-    const page = n.loc?.page ?? null
-    const hasChildren = !!n.children && n.children.length > 0
-    const label = n.title || n.vision?.text_anchor || (isVisual ? n.vision?.type : '') || n.kind
-    if (hasChildren) {
-      return (
-        <DocirToggle
-          key={n.id}
-          node={n}
-          depth={depth}
-          isVisual={isVisual}
-          page={page}
-          label={label}
-          onJumpPage={onJumpPage}
-          renderNode={renderNode}
-        />
-      )
-    }
-    // Leaf: a single row indented by depth. No toggle, no children.
-    return (
-      <div
-        key={n.id}
-        className="flex items-center gap-1 rounded px-1 py-0.5 hover:bg-[hsl(var(--glass-hover))]"
-        style={{ paddingLeft: depth * 12 }}
-      >
-        <span className="w-3 shrink-0" />
-        {isVisual ? (
-          <Eye className="h-3 w-3 shrink-0 text-amber-500" />
-        ) : (
-          <span className="w-3 shrink-0" />
-        )}
-        {page != null ? (
-          <button
-            onClick={() => onJumpPage(page)}
-            className="min-w-0 flex-1 truncate text-left text-[11.5px] text-foreground hover:underline"
-            title={String(label)}
-          >
-            {label}
-            <span className="ml-1 text-[10px] text-muted-foreground">p{page}</span>
-          </button>
-        ) : (
-          <span className="min-w-0 flex-1 truncate text-[11.5px] text-muted-foreground" title={String(label)}>
-            {label}
-          </span>
-        )}
-      </div>
-    )
-  }
-  return (
-    <div className="mb-4 rounded-lg border border-[hsl(var(--glass-border))] bg-muted/20">
-      <button
-        onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center gap-1.5 px-3 py-2 text-left text-[12px] font-semibold text-foreground"
-      >
-        {open ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
-        <ListTree className="h-3.5 w-3.5 text-muted-foreground" />
-        {t('reader.structure')}
-      </button>
-      {open && <div className="border-t border-[hsl(var(--glass-border))] px-2 py-2">{renderNode(root, 0)}</div>}
-    </div>
-  )
-}
+type DocumentsTab = 'jobs' | 'remote'
 
-/** Expandable node with children: renders its own row, then stacks descendants
- *  vertically below it. Children MUST be siblings of the row (block flow), not
- *  nested inside the row's flex container - otherwise they lay out horizontally
- *  beside the toggle instead of dropping down as a sub-tree. */
-function DocirToggle({
-  node,
-  depth,
-  isVisual,
-  page,
-  label,
-  onJumpPage,
-  renderNode,
-}: {
-  node: DocirNode
-  depth: number
-  isVisual: boolean
-  page: number | null
-  label: string
-  onJumpPage: (p: number) => void
-  renderNode: (n: DocirNode, d: number) => ReactNode
-}) {
-  const [exp, setExp] = useState(depth < 1)
-  return (
-    <div>
-      <div
-        className="flex items-center gap-1 rounded px-1 py-0.5 hover:bg-[hsl(var(--glass-hover))]"
-        style={{ paddingLeft: depth * 12 }}
-      >
-        <button
-          onClick={() => setExp((v) => !v)}
-          className="grid h-3 w-3 shrink-0 place-items-center text-muted-foreground"
-          aria-label={exp ? 'collapse' : 'expand'}
-        >
-          {exp ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
-        </button>
-        {isVisual ? (
-          <Eye className="h-3 w-3 shrink-0 text-amber-500" />
-        ) : (
-          <span className="w-3 shrink-0" />
-        )}
-        {page != null ? (
-          <button
-            onClick={() => onJumpPage(page)}
-            className="min-w-0 flex-1 truncate text-left text-[11.5px] text-foreground hover:underline"
-            title={String(label)}
-          >
-            {label}
-            <span className="ml-1 text-[10px] text-muted-foreground">p{page}</span>
-          </button>
-        ) : (
-          <span className="min-w-0 flex-1 truncate text-[11.5px] text-muted-foreground" title={String(label)}>
-            {label}
-          </span>
-        )}
-      </div>
-      {exp && node.children?.map((c) => renderNode(c, depth + 1))}
-    </div>
-  )
-}
-
-function DocumentReaderDrawer({
-  doc,
-  body,
-  loading,
-  error,
-  isEmpty,
-  kb,
-  onJumpPage,
-  page,
-  totalPages,
-  onFirst,
-  onPrev,
-  onNext,
-  onLast,
-  onRetry,
-  onClose,
-}: {
-  doc: WikiDocument | null
-  body: ReactNode
-  loading: boolean
-  error: string | null
-  isEmpty: boolean
-  kb?: string
-  onJumpPage?: (p: number) => void
-  page: number
-  totalPages: number
-  onFirst: () => void
-  onPrev: () => void
-  onNext: () => void
-  onLast: () => void
-  onRetry: () => void
-  onClose: () => void
-}) {
-  const { t } = useTranslation(['kb', 'common'])
-  const reduce = useReducedMotion()
-  // The control that opened the drawer, captured before Radix moves focus in,
-  // so focus returns to it on close (mirrors KbSettingsSheet).
-  const openerRef = useRef<HTMLElement | null>(null)
-  const scrollRef = useRef<HTMLDivElement>(null)
-  const open = doc !== null
-  // Keep the last doc visible during the exit animation (doc is null once closed).
-  const [shown, setShown] = useState<WikiDocument | null>(doc)
-  useEffect(() => {
-    if (doc) setShown(doc)
-  }, [doc])
-  // Reset scroll to top when switching documents or turning pages.
-  useEffect(() => {
-    if (doc) scrollRef.current?.scrollTo(0, 0)
-  }, [doc, page])
-  // `modal={false}` (below) sidesteps Radix's react-remove-scroll, whose
-  // document-level wheel listener cancels wheel over the reader body via a
-  // React-18 timing gap. The trade-off: Radix no longer applies its own
-  // body-scroll lock or Esc-to-close (the DismissableLayer escape listener
-  // only attaches when it is the highest layer, which is unreliable with
-  // `forceMount` + `AnimatePresence` ref timing). Restore both here.
-  useEffect(() => {
-    if (!open) return
-    const prev = document.body.style.overflow
-    document.body.style.overflow = 'hidden'
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape') return
-      const t = e.target as HTMLElement | null
-      const tag = t?.tagName
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || t?.isContentEditable) return
-      onClose()
-    }
-    window.addEventListener('keydown', onKey)
-    return () => {
-      document.body.style.overflow = prev
-      window.removeEventListener('keydown', onKey)
-    }
-  }, [open, onClose])
-
-  return (
-    <Dialog.Root
-      open={open}
-      modal={false}
-      onOpenChange={(next) => {
-        if (!next) onClose()
-      }}
-    >
-      <AnimatePresence>
-        {open && (
-          <Dialog.Portal forceMount>
-            {/* Radix `Dialog.Overlay` renders null when `modal={false}`
-                (see @radix-ui/react-dialog: `context.modal ? ... : null`),
-                so render the backdrop as a plain motion.div instead - it
-                still portals above the page and `onClick` closes. */}
-            <motion.div
-              className="fixed inset-0 z-40 bg-black/30"
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              transition={reduce ? { duration: 0.12 } : { duration: 0.2 }}
-              onClick={(e) => {
-                // Only close on the backdrop itself; clicks that originate in
-                // the content must not dismiss the drawer.
-                if (e.target === e.currentTarget) onClose()
-              }}
-            />
-            <Dialog.Content
-              asChild
-              forceMount
-              aria-describedby={undefined}
-              onOpenAutoFocus={() => {
-                openerRef.current = document.activeElement as HTMLElement | null
-              }}
-              onCloseAutoFocus={(e) => {
-                e.preventDefault()
-                openerRef.current?.focus()
-              }}
-              // Route outside-dismiss only through the overlay's own
-              // `onClick` below: the backdrop is a sibling of the content
-              // (hence "outside" to Radix), and `modal={false}` no longer
-              // auto-closes on focus loss, so these guards avoid a redundant
-              // DismissableLayer dismissal competing with the backdrop click.
-              onPointerDownOutside={(e) => e.preventDefault()}
-              onInteractOutside={(e) => e.preventDefault()}
-            >
-              <motion.aside
-                className="fixed inset-y-0 right-0 z-50 flex w-[min(70vw,900px)] max-w-full flex-col glass border-l border-[hsl(var(--glass-border))] shadow-glass-lg rounded-l-apple-lg"
-                initial={reduce ? { opacity: 0 } : { opacity: 0, x: 24 }}
-                animate={reduce ? { opacity: 1 } : { opacity: 1, x: 0 }}
-                exit={reduce ? { opacity: 0 } : { opacity: 0, x: 24 }}
-                transition={reduce ? { duration: 0.12 } : { type: 'spring', bounce: 0, duration: 0.3 }}
-                onClick={(e) => e.stopPropagation()}
-              >
-                <div className="flex shrink-0 items-center gap-3 border-b border-[hsl(var(--glass-border))] px-5 py-3">
-                  <span className="grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-[hsl(var(--glass-border))] bg-muted">
-                    <FileText className="h-4 w-4 text-muted-foreground" />
-                  </span>
-                  <div className="min-w-0">
-                    <Dialog.Title asChild>
-                      <div className="truncate text-[13.5px] font-medium text-foreground">{shown?.name}</div>
-                    </Dialog.Title>
-                    <div className="mt-0.5 flex items-center gap-2 text-[12px] text-muted-foreground">
-                      {shown?.display_type && <span>{shown.display_type}</span>}
-                      {shown?.pages != null && <span>· {t('kb:docs.pages', { count: shown.pages })}</span>}
-                      <span className="inline-flex items-center gap-1 rounded bg-muted px-1.5 py-px text-[11px]">
-                        <BookOpen className="h-3 w-3" />
-                        {t('kb:docs.reader.readonly')}
-                      </span>
-                    </div>
-                  </div>
-                  <button
-                    onClick={onClose}
-                    title={t('kb:docs.reader.close')}
-                    aria-label={t('kb:docs.reader.close')}
-                    className="ml-auto grid h-8 w-8 shrink-0 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                  >
-                    <X className="h-4 w-4" />
-                  </button>
-                </div>
-
-                <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
-                  <div className="mx-auto max-w-[72ch] px-6 py-6">
-                    {loading && (
-                      <div className="flex items-center justify-center gap-2 py-16 text-[13px] text-muted-foreground">
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                        {t('kb:docs.reader.loading')}
-                      </div>
-                    )}
-                    {error && (
-                      <div className="py-16 text-center">
-                        <p className="text-[13px] text-red-600 dark:text-red-400">
-                          {t('kb:docs.reader.error', { error })}
-                        </p>
-                        <button
-                          onClick={onRetry}
-                          className="mt-3 inline-flex h-8 items-center gap-1.5 rounded-lg border border-[hsl(var(--glass-border))] px-3 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-accent"
-                        >
-                          <RefreshCw className="h-3 w-3" />
-                          {t('kb:docs.reader.retry')}
-                        </button>
-                      </div>
-                    )}
-                    {!loading && !error && isEmpty && (
-                      <div className="py-16 text-center text-[13px] text-muted-foreground">
-                        {totalPages > 1
-                          ? t('kb:docs.reader.emptyPage')
-                          : t('kb:docs.reader.emptyDoc')}
-                      </div>
-                    )}
-                    {!loading && !error && !isEmpty && kb && shown?.hash && onJumpPage && (
-                      <DocirOutline kb={kb} hash={shown.hash} onJumpPage={onJumpPage} />
-                    )}
-                    {!loading && !error && !isEmpty && (
-                      <div className="text-[14px] leading-relaxed text-foreground">{body}</div>
-                    )}
-                  </div>
-                </div>
-
-                {/* Page navigation: hidden for single-page (short) docs. Prev/next
-                    disabled at the ends so keyboard activation is a no-op, not a
-                    wrap-around. */}
-                {totalPages > 1 && (
-                  <div className="flex shrink-0 items-center justify-center gap-1.5 border-t border-[hsl(var(--glass-border))] px-5 py-2.5">
-                    <button
-                      type="button"
-                      onClick={onFirst}
-                      disabled={page <= 1}
-                      aria-label={t('kb:docs.reader.firstPage')}
-                      title={t('kb:docs.reader.firstPage')}
-                      className="grid h-8 w-8 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
-                    >
-                      <ChevronsLeft className="h-4 w-4" />
-                    </button>
-                    <button
-                      type="button"
-                      onClick={onPrev}
-                      disabled={page <= 1}
-                      aria-label={t('kb:docs.reader.prevPage')}
-                      title={t('kb:docs.reader.prevPage')}
-                      className="grid h-8 w-8 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
-                    >
-                      <ChevronLeft className="h-4 w-4" />
-                    </button>
-                    <span className="min-w-[5.5rem] text-center text-[12px] tabular-nums text-muted-foreground">
-                      {t('kb:docs.reader.pageOf', { page, total: totalPages })}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={onNext}
-                      disabled={page >= totalPages}
-                      aria-label={t('kb:docs.reader.nextPage')}
-                      title={t('kb:docs.reader.nextPage')}
-                      className="grid h-8 w-8 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
-                    >
-                      <ChevronRight className="h-4 w-4" />
-                    </button>
-                    <button
-                      type="button"
-                      onClick={onLast}
-                      disabled={page >= totalPages}
-                      aria-label={t('kb:docs.reader.lastPage')}
-                      title={t('kb:docs.reader.lastPage')}
-                      className="grid h-8 w-8 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
-                    >
-                      <ChevronsRight className="h-4 w-4" />
-                    </button>
-                  </div>
-                )}
-              </motion.aside>
-            </Dialog.Content>
-          </Dialog.Portal>
-        )}
-      </AnimatePresence>
-    </Dialog.Root>
-  )
-}
-
-type DocumentsTab = 'jobs' | 'documents' | 'remote'
+type SourceDeleteTarget =
+  | { kind: 'compiled'; document: WikiDocument }
+  | { kind: 'pending'; document: PendingDocument }
 
 /** Documents workspace: compiling work, the source library, and planned remote
  * sources each get a focused tab instead of competing in one long scroll. */
@@ -1162,146 +754,107 @@ type DocumentsTab = 'jobs' | 'documents' | 'remote'
 function DocumentsPane({
   kb,
   documents,
-  invError,
+  pendingDocuments,
   uploading,
   dragActive,
   fileInputRef,
   onDragActiveChange,
   onUpload,
-  onCancelUpload,
   onRefresh,
   onDelete,
   taskFiles,
   selectedLogs,
-  selectedRunning,
-  selectedCancelling,
+  cancellingJobIds,
+  onCancelFile,
   onRetryFile,
+  onCompilePendingFile,
 }: {
   kb: string
   documents: WikiDocument[]
-  invError: string | null
+  pendingDocuments: PendingDocument[]
   uploading: boolean
   dragActive: boolean
   fileInputRef: RefObject<HTMLInputElement | null>
   onDragActiveChange: (active: boolean) => void
   onUpload: (files: File[]) => void
-  onCancelUpload: () => void
   onRefresh: () => void
   onDelete: (identifier: string) => Promise<void>
   taskFiles: CompileTaskFile[]
   selectedLogs: UploadLogLine[]
-  selectedRunning: boolean
-  selectedCancelling: boolean
+  cancellingJobIds: ReadonlySet<string>
+  onCancelFile: (file: CompileTaskFile) => void
   onRetryFile: (file: CompileTaskFile) => void
+  onCompilePendingFile: (document: PendingDocument) => void
 }) {
   const { t } = useTranslation(['kb', 'common'])
   const reduce = useReducedMotion()
   const [activeTab, setActiveTab] = useState<DocumentsTab>('jobs')
-  // Inline delete confirm: `confirmName` is the row awaiting confirmation;
-  // `deletingName` is the row whose remove request is in flight.
-  const [confirmName, setConfirmName] = useState<string | null>(null)
-  const [deletingName, setDeletingName] = useState<string | null>(null)
-  // Document reader drawer. State lives HERE (not in the drawer, which unmounts
-  // on close via Radix) so the per-hash cache and memoized body survive
-  // open/close and re-opening is instant without re-parsing Markdown.
-  const [openDoc, setOpenDoc] = useState<WikiDocument | null>(null)
-  const [docSource, setDocSource] = useState<DocumentSource | null>(null)
-  const [docLoading, setDocLoading] = useState(false)
-  const [docError, setDocError] = useState<string | null>(null)
-  const [docReloadSeq, setDocReloadSeq] = useState(0)
-  // Current source page (1-indexed) for the open doc. Long docs paginate one
-  // page per request; short docs are a single page.
-  const [docPage, setDocPage] = useState(1)
-  // Last known total page count for the open doc. Persisted across page-change
-  // fetches (which null `docSource` while loading) so the footer - and the
-  // focused prev/next button inside it - stays mounted; otherwise Radix Dialog
-  // closes when the focused button unmounts mid-click.
-  const [docTotalPages, setDocTotalPages] = useState(1)
-  const sourceCache = useRef<Map<string, DocumentSource>>(new Map())
-  const closeDrawer = useCallback(() => setOpenDoc(null), [])
-  // Opening a (different) doc resets to page 1 and clears the cached total so
-  // the footer doesn't briefly show the previous doc's page count. Done here
-  // in the open handler (not an effect) to avoid a set-state-in-effect render
-  // cascade and a flash of the wrong page.
-  const openDocAt = useCallback((d: WikiDocument) => {
-    setDocPage(1)
-    setDocTotalPages(1)
-    setOpenDoc(d)
-  }, [])
-  // Jump the open reader to a specific page (used by the DocIR structure tree).
-  const jumpToPage = useCallback((p: number) => {
-    setDocPage(p)
-    setDocReloadSeq((s) => s + 1)
-  }, [])
-  const openHash = openDoc?.hash ?? null
-
-  // Drop cached content when the inventory changes (a recompile can rewrite a
-  // document's converted text under the same raw hash), so the next open
-  // refetches instead of serving stale text.
-  useEffect(() => {
-    sourceCache.current.clear()
-  }, [documents])
-
-  // Fetch the open document's current page (per-`hash:page` cache; retry via
-  // docReloadSeq). Cached pages render instantly without a refetch.
-  useEffect(() => {
-    if (!openHash) return
-    const cacheKey = `${openHash}:${docPage}`
-    const cached = sourceCache.current.get(cacheKey)
-    if (cached) {
-      setDocSource(cached)
-      setDocError(null)
-      setDocLoading(false)
-      return
-    }
-    let cancelled = false
-    setDocLoading(true)
-    setDocSource(null)
-    setDocError(null)
-    getDocumentSource(kb, openHash, docPage)
-      .then((r) => {
-        if (cancelled) return
-        sourceCache.current.set(cacheKey, r)
-        setDocSource(r)
-        setDocTotalPages(r.total_pages)
-      })
-      .catch((e) => {
-        if (!cancelled) setDocError(errMsg(e))
-      })
-      .finally(() => {
-        if (!cancelled) setDocLoading(false)
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [kb, openHash, docPage, docReloadSeq])
-
-  // Parse Markdown once per fetched source (stable cache ref → no re-parse).
-  const readerBody = useMemo(
-    () =>
-      docSource && docSource.content.trim() ? <MarkdownView source={docSource.content} /> : null,
-    [docSource],
+  const [previewDocument, setPreviewDocument] = useState<WikiDocument | null>(null)
+  const [recompilingDocumentNames, setRecompilingDocumentNames] = useState<Set<string>>(new Set())
+  const [deleteTarget, setDeleteTarget] = useState<SourceDeleteTarget | null>(null)
+  const [deletingDocumentName, setDeletingDocumentName] = useState<string | null>(null)
+  const [hiddenTaskFileIds, setHiddenTaskFileIds] = useState<Set<string>>(new Set())
+  const visibleTaskFiles = useMemo(
+    () => taskFiles.filter((file) => !hiddenTaskFileIds.has(file.id)),
+    [hiddenTaskFileIds, taskFiles],
   )
-  const readerEmpty = docSource != null && docSource.content.trim().length === 0
-
-  const handleDelete = async (name: string) => {
-    setDeletingName(name)
-    try {
-      await onDelete(name)
-    } finally {
-      setDeletingName(null)
-      setConfirmName(null)
-    }
-  }
-
+  const fileCount = useMemo(
+    () => new Set([...visibleTaskFiles.map((file) => file.name), ...documents.map((document) => document.name), ...pendingDocuments.map((document) => document.name)]).size,
+    [documents, pendingDocuments, visibleTaskFiles],
+  )
   const beginUpload = useCallback(
     (files: File[]) => {
       if (files.length === 0) return
-      setActiveTab('jobs')
       onUpload(files)
     },
     [onUpload],
   )
+  const recompileDocument = useCallback(async (document: WikiDocument) => {
+    if (recompilingDocumentNames.has(document.name)) return
+    setRecompilingDocumentNames((names) => new Set(names).add(document.name))
+    try {
+      for await (const event of runRecompile(kb, document.name)) {
+        if (event.event === 'error') throw new Error(String(event.data?.message ?? 'Recompile failed'))
+      }
+      onRefresh()
+    } catch (cause) {
+      toast.error(errMsg(cause))
+    } finally {
+      setRecompilingDocumentNames((names) => {
+        const next = new Set(names)
+        next.delete(document.name)
+        return next
+      })
+    }
+  }, [kb, onRefresh, recompilingDocumentNames])
+  const confirmDeleteDocument = useCallback(async () => {
+    if (!deleteTarget || deletingDocumentName) return
+    setDeletingDocumentName(deleteTarget.document.name)
+    try {
+      if (deleteTarget.kind === 'compiled') {
+        const document = deleteTarget.document
+        await onDelete(document.name)
+        if (previewDocument?.hash === document.hash) setPreviewDocument(null)
+      } else {
+        const document = deleteTarget.document
+        const result = await deletePendingDocument(kb, document)
+        setHiddenTaskFileIds((ids) => {
+          const next = new Set(ids)
+          taskFiles
+            .filter((file) => file.sourcePath === document.path || file.name === document.name)
+            .forEach((file) => next.add(file.id))
+          return next
+        })
+        toast.success(t('kb:docs.delete.success', { name: result.name || document.name }))
+        await onRefresh()
+      }
+      setDeleteTarget(null)
+    } catch (cause) {
+      toast.error(t('kb:docs.delete.error', { error: errMsg(cause) }))
+    } finally {
+      setDeletingDocumentName(null)
+    }
+  }, [deleteTarget, deletingDocumentName, kb, onDelete, onRefresh, previewDocument, t, taskFiles])
 
   return (
     <>
@@ -1340,8 +893,7 @@ function DocumentsPane({
 
           <Tabs value={activeTab} onValueChange={(value) => setActiveTab(value as DocumentsTab)} className="mt-5 gap-0">
             <TabsList className="h-auto w-full justify-start gap-1 overflow-x-auto rounded-none border-b border-[hsl(var(--glass-border))] bg-transparent p-0">
-              <WorkspaceTab value="jobs" icon={ListChecks} label={t('kb:workspace.tabs.jobs')} count={taskFiles.length} />
-              <WorkspaceTab value="documents" icon={FolderOpen} label={t('kb:workspace.tabs.documents')} count={documents.length} />
+              <WorkspaceTab value="jobs" icon={ListChecks} label={t('kb:workspace.tabs.jobs')} count={fileCount} />
               <WorkspaceTab value="remote" icon={Cloud} label={t('kb:workspace.tabs.remote')} />
             </TabsList>
           </Tabs>
@@ -1362,25 +914,20 @@ function DocumentsPane({
                   onDragActiveChange={onDragActiveChange}
                   onUpload={beginUpload}
                   onChooseFiles={() => fileInputRef.current?.click()}
-                  taskFiles={taskFiles}
+                  taskFiles={visibleTaskFiles}
                   documents={documents}
+                  pendingDocuments={pendingDocuments}
                   selectedLogs={selectedLogs}
-                  selectedRunning={selectedRunning}
-                  selectedCancelling={selectedCancelling}
-                  onCancelUpload={onCancelUpload}
+                  cancellingJobIds={cancellingJobIds}
+                  onCancelFile={onCancelFile}
                   onRetryFile={onRetryFile}
-                />
-              )}
-              {activeTab === 'documents' && (
-                <UploadedDocumentsTab
-                  documents={documents}
-                  invError={invError}
-                  confirmName={confirmName}
-                  deletingName={deletingName}
-                  onRefresh={onRefresh}
-                  onOpen={openDocAt}
-                  onConfirmDelete={setConfirmName}
-                  onDelete={handleDelete}
+                  onCompilePendingFile={onCompilePendingFile}
+                  onPreviewDocument={setPreviewDocument}
+                  recompilingDocumentNames={recompilingDocumentNames}
+                  onRecompileDocument={recompileDocument}
+                  onRequestDeleteDocument={(document) => setDeleteTarget({ kind: 'compiled', document })}
+                  onRequestDeletePending={(document) => setDeleteTarget({ kind: 'pending', document })}
+                  deletingDocumentName={deletingDocumentName}
                 />
               )}
               {activeTab === 'remote' && <RemoteSourcesTab />}
@@ -1388,24 +935,260 @@ function DocumentsPane({
           </AnimatePresence>
         </div>
       </div>
-    <DocumentReaderDrawer
-      doc={openDoc}
-      body={readerBody}
-      loading={docLoading}
-      error={docError}
-      isEmpty={readerEmpty}
-      kb={kb}
-      onJumpPage={jumpToPage}
-      page={docSource?.page ?? docPage}
-      totalPages={docSource?.total_pages ?? docTotalPages}
-      onFirst={() => setDocPage(1)}
-      onPrev={() => setDocPage((p) => Math.max(1, p - 1))}
-      onNext={() => setDocPage((p) => p + 1)}
-      onLast={() => setDocPage(docSource?.total_pages ?? docTotalPages)}
-      onRetry={() => setDocReloadSeq((s) => s + 1)}
-      onClose={closeDrawer}
-    />
+      <DocumentPreviewDrawer kb={kb} document={previewDocument} onClose={() => setPreviewDocument(null)} />
+      <AlertDialog
+        open={deleteTarget !== null}
+        onOpenChange={(open) => {
+          if (!open && !deletingDocumentName) setDeleteTarget(null)
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t('kb:docs.delete.prompt')}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {deleteTarget?.document.name}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={!!deletingDocumentName}>{t('kb:docs.delete.cancel')}</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={!!deletingDocumentName}
+              onClick={() => void confirmDeleteDocument()}
+              className="bg-red-600 text-white hover:bg-red-700 dark:bg-red-600 dark:hover:bg-red-700"
+            >
+              {deletingDocumentName ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
+              {t('kb:docs.delete.confirm')}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </>
+  )
+}
+
+/** Collapsible DocIR outline for the source preview. Clicking a numbered node
+ * switches the preview to that source page. */
+function DocirOutline({ kb, hash, onJumpPage }: { kb: string; hash: string; onJumpPage: (page: number) => void }) {
+  const { t } = useTranslation('legal')
+  const [open, setOpen] = useState(false)
+  const [root, setRoot] = useState<DocirNode | null>(null)
+
+  useEffect(() => {
+    let stale = false
+    setRoot(null)
+    getDocirByHash(kb, hash)
+      .then((result) => {
+        if (!stale) setRoot(result.docir?.root ?? null)
+      })
+      .catch(() => {
+        if (!stale) setRoot(null)
+      })
+    return () => {
+      stale = true
+    }
+  }, [kb, hash])
+
+  if (!root) return null
+  return (
+    <div className="mb-5 rounded-lg border border-[hsl(var(--glass-border))] bg-muted/20">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        className="flex w-full items-center gap-1.5 px-3 py-2 text-left text-[12px] font-semibold text-foreground"
+      >
+        {open ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+        <ListTree className="h-3.5 w-3.5 text-muted-foreground" />
+        {t('reader.structure')}
+      </button>
+      {open && <div className="border-t border-[hsl(var(--glass-border))] px-2 py-2"><DocirNodeRow node={root} depth={0} onJumpPage={onJumpPage} /></div>}
+    </div>
+  )
+}
+
+function DocirNodeRow({
+  node,
+  depth,
+  onJumpPage,
+}: {
+  node: DocirNode
+  depth: number
+  onJumpPage: (page: number) => void
+}): ReactNode {
+  const [expanded, setExpanded] = useState(depth < 1)
+  const hasChildren = !!node.children?.length
+  const page = node.loc?.page ?? null
+  const visual = node.kind === 'figure_anchor'
+  const label = node.title || node.vision?.text_anchor || (visual ? node.vision?.type : '') || node.kind
+  return (
+    <div>
+      <div
+        className="flex items-center gap-1 rounded px-1 py-0.5 hover:bg-[hsl(var(--glass-hover))]"
+        style={{ paddingLeft: depth * 12 }}
+      >
+        {hasChildren ? (
+          <button
+            type="button"
+            onClick={() => setExpanded((value) => !value)}
+            className="grid h-3 w-3 shrink-0 place-items-center text-muted-foreground"
+            aria-label={expanded ? 'collapse' : 'expand'}
+          >
+            {expanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+          </button>
+        ) : <span className="w-3 shrink-0" />}
+        {visual ? <Eye className="h-3 w-3 shrink-0 text-amber-500" /> : <span className="w-3 shrink-0" />}
+        {page != null ? (
+          <button
+            type="button"
+            onClick={() => onJumpPage(page)}
+            className="min-w-0 flex-1 truncate text-left text-[11.5px] text-foreground hover:underline"
+            title={String(label)}
+          >
+            {label}<span className="ml-1 text-[10px] text-muted-foreground">p{page}</span>
+          </button>
+        ) : <span className="min-w-0 flex-1 truncate text-[11.5px] text-muted-foreground" title={String(label)}>{label}</span>}
+      </div>
+      {expanded && node.children?.map((child) => <DocirNodeRow key={child.id} node={child} depth={depth + 1} onJumpPage={onJumpPage} />)}
+    </div>
+  )
+}
+
+/** Source preview is intentionally attached to the unified task list: a
+ * document remains readable without bringing back a separate library tab. */
+function DocumentPreviewDrawer({
+  kb,
+  document,
+  onClose,
+}: {
+  kb: string
+  document: WikiDocument | null
+  onClose: () => void
+}) {
+  const { t } = useTranslation('kb')
+  const [source, setSource] = useState<DocumentSource | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [page, setPage] = useState(1)
+  const [reload, setReload] = useState(0)
+
+  useEffect(() => {
+    setPage(1)
+  }, [document?.hash])
+
+  useEffect(() => {
+    if (!document) return
+    let stale = false
+    setLoading(true)
+    setError(null)
+    setSource(null)
+    getDocumentSource(kb, document.hash, page)
+      .then((result) => {
+        if (!stale) setSource(result)
+      })
+      .catch((cause) => {
+        if (!stale) setError(errMsg(cause))
+      })
+      .finally(() => {
+        if (!stale) setLoading(false)
+      })
+    return () => {
+      stale = true
+    }
+  }, [document, kb, page, reload])
+
+  const totalPages = source?.total_pages ?? 1
+  return (
+    <Dialog.Root open={document !== null} onOpenChange={(open) => !open && onClose()}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="fixed inset-0 z-40 bg-black/30 backdrop-blur-[1px]" />
+        <Dialog.Content
+          aria-describedby={undefined}
+          className="fixed inset-y-0 right-0 z-50 flex w-[min(92vw,860px)] flex-col border-l border-[hsl(var(--glass-border))] bg-background shadow-2xl focus:outline-none"
+        >
+          <div className="flex shrink-0 items-center gap-3 border-b border-[hsl(var(--glass-border))] px-5 py-3">
+            <span className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground">
+              <FileText className="h-4 w-4" />
+            </span>
+            <div className="min-w-0">
+              <Dialog.Title className="truncate text-[13.5px] font-medium text-foreground">{document?.name}</Dialog.Title>
+              <p className="mt-0.5 text-[11.5px] text-muted-foreground">
+                {document?.display_type} · {t('docs.reader.title')}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={onClose}
+              title={t('docs.reader.close')}
+              aria-label={t('docs.reader.close')}
+              className="ml-auto grid h-8 w-8 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+
+          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
+            <div className="mx-auto max-w-[72ch] px-6 py-6">
+              {loading && (
+                <div className="flex items-center justify-center gap-2 py-16 text-[13px] text-muted-foreground">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  {t('docs.reader.loading')}
+                </div>
+              )}
+              {error && (
+                <div className="py-16 text-center">
+                  <p className="text-[13px] text-red-600 dark:text-red-400">{t('docs.reader.error', { error })}</p>
+                  <button
+                    type="button"
+                    onClick={() => setReload((value) => value + 1)}
+                    className="mt-3 inline-flex h-8 items-center gap-1.5 rounded-lg border border-[hsl(var(--glass-border))] px-3 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-accent"
+                  >
+                    <RefreshCw className="h-3 w-3" />
+                    {t('docs.reader.retry')}
+                  </button>
+                </div>
+              )}
+              {!loading && !error && source && (
+                source.content.trim() ? (
+                  <>
+                    {document && <DocirOutline kb={kb} hash={document.hash} onJumpPage={setPage} />}
+                    <MarkdownView source={source.content} />
+                  </>
+                ) : (
+                  <div className="py-16 text-center text-[13px] text-muted-foreground">
+                    {totalPages > 1 ? t('docs.reader.emptyPage') : t('docs.reader.emptyDoc')}
+                  </div>
+                )
+              )}
+            </div>
+          </div>
+
+          {totalPages > 1 && (
+            <div className="flex shrink-0 items-center justify-center gap-2 border-t border-[hsl(var(--glass-border))] px-5 py-2.5">
+              <button
+                type="button"
+                onClick={() => setPage((value) => Math.max(1, value - 1))}
+                disabled={page <= 1}
+                aria-label={t('docs.reader.prevPage')}
+                className="grid h-8 w-8 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
+              >
+                <ChevronLeft className="h-4 w-4" />
+              </button>
+              <span className="min-w-[5.5rem] text-center text-[12px] tabular-nums text-muted-foreground">
+                {t('docs.reader.pageOf', { page, total: totalPages })}
+              </span>
+              <button
+                type="button"
+                onClick={() => setPage((value) => Math.min(totalPages, value + 1))}
+                disabled={page >= totalPages}
+                aria-label={t('docs.reader.nextPage')}
+                className="grid h-8 w-8 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
+              >
+                <ChevronRight className="h-4 w-4" />
+              </button>
+            </div>
+          )}
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
   )
 }
 
@@ -1444,11 +1227,18 @@ function CompileJobsTab({
   onChooseFiles,
   taskFiles,
   documents,
+  pendingDocuments,
   selectedLogs,
-  selectedRunning,
-  selectedCancelling,
-  onCancelUpload,
+  cancellingJobIds,
+  onCancelFile,
   onRetryFile,
+  onCompilePendingFile,
+  onPreviewDocument,
+  recompilingDocumentNames,
+  onRecompileDocument,
+  onRequestDeleteDocument,
+  onRequestDeletePending,
+  deletingDocumentName,
 }: {
   dragActive: boolean
   uploading: boolean
@@ -1457,11 +1247,18 @@ function CompileJobsTab({
   onChooseFiles: () => void
   taskFiles: CompileTaskFile[]
   documents: WikiDocument[]
+  pendingDocuments: PendingDocument[]
   selectedLogs: UploadLogLine[]
-  selectedRunning: boolean
-  selectedCancelling: boolean
-  onCancelUpload: () => void
+  cancellingJobIds: ReadonlySet<string>
+  onCancelFile: (file: CompileTaskFile) => void
   onRetryFile: (file: CompileTaskFile) => void
+  onCompilePendingFile: (document: PendingDocument) => void
+  onPreviewDocument: (document: WikiDocument) => void
+  recompilingDocumentNames: ReadonlySet<string>
+  onRecompileDocument: (document: WikiDocument) => void
+  onRequestDeleteDocument: (document: WikiDocument) => void
+  onRequestDeletePending: (document: PendingDocument) => void
+  deletingDocumentName: string | null
 }) {
   const { t } = useTranslation('kb')
   return (
@@ -1508,116 +1305,21 @@ function CompileJobsTab({
         <JobsPanel
           taskFiles={taskFiles}
           documents={documents}
+          pendingDocuments={pendingDocuments}
           selectedLogs={selectedLogs}
-          selectedRunning={selectedRunning}
-          selectedCancelling={selectedCancelling}
-          onCancelUpload={onCancelUpload}
+          cancellingJobIds={cancellingJobIds}
+          onCancelFile={onCancelFile}
           onRetryFile={onRetryFile}
+          onCompilePendingFile={onCompilePendingFile}
+          onPreviewDocument={onPreviewDocument}
+          recompilingDocumentNames={recompilingDocumentNames}
+          onRecompileDocument={onRecompileDocument}
+          onRequestDeleteDocument={onRequestDeleteDocument}
+          onRequestDeletePending={onRequestDeletePending}
+          deletingDocumentName={deletingDocumentName}
         />
       </section>
     </div>
-  )
-}
-
-function UploadedDocumentsTab({
-  documents,
-  invError,
-  confirmName,
-  deletingName,
-  onRefresh,
-  onOpen,
-  onConfirmDelete,
-  onDelete,
-}: {
-  documents: WikiDocument[]
-  invError: string | null
-  confirmName: string | null
-  deletingName: string | null
-  onRefresh: () => void
-  onOpen: (document: WikiDocument) => void
-  onConfirmDelete: (name: string | null) => void
-  onDelete: (name: string) => Promise<void>
-}) {
-  const { t } = useTranslation(['kb', 'common'])
-  return (
-    <section>
-      <div className="flex items-end justify-between gap-4">
-        <div>
-          <h3 className="text-[14px] font-semibold text-foreground">{t('docs.heading', { count: documents.length })}</h3>
-          <p className="mt-1 text-[12px] text-muted-foreground">{t('workspace.libraryNote')}</p>
-        </div>
-        <button
-          type="button"
-          onClick={onRefresh}
-          className="inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-        >
-          <RefreshCw className="h-3.5 w-3.5" />{t('common:actions.refresh')}
-        </button>
-      </div>
-      <div className="mt-5 border-y border-[hsl(var(--glass-border))]">
-        {invError && (
-          <div className="my-3 rounded-lg border border-red-200/70 bg-red-50 px-3 py-2 text-[12px] text-red-600 dark:border-red-500/25 dark:bg-red-500/10 dark:text-red-400">
-            {t('loadError', { error: invError })}
-          </div>
-        )}
-        {!invError && documents.length === 0 && (
-          <div className="py-14 text-center text-[13px] text-muted-foreground">{t('docs.empty')}</div>
-        )}
-        {documents.map((d, i) => (
-          <div
-            key={d.hash || d.name || i}
-            className="group flex items-center gap-3 border-b border-[hsl(var(--glass-border))] py-3 last:border-b-0"
-          >
-            <button
-              type="button"
-              onClick={() => onOpen(d)}
-              title={t('docs.reader.open')}
-              className="flex min-w-0 flex-1 items-center gap-3 rounded-lg text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-brand/50"
-            >
-              <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-muted text-muted-foreground transition-colors group-hover:bg-accent-brand/10 group-hover:text-accent-brand">
-                <FileText className="h-4 w-4" />
-              </span>
-              <span className="min-w-0">
-                <span className="block truncate text-[13px] font-medium text-foreground">{d.name}</span>
-                <span className="mt-0.5 block text-[11.5px] text-muted-foreground">
-                  {d.display_type}
-                  {d.pages != null && <> · {t('docs.pages', { count: d.pages })}</>}
-                </span>
-              </span>
-            </button>
-            <div className="flex shrink-0 items-center gap-2">
-              {d.hash && <span className="hidden rounded bg-muted px-1.5 py-0.5 font-mono2 text-[10.5px] text-muted-foreground sm:inline">{d.hash.slice(0, 8)}</span>}
-              {d.name && (confirmName === d.name ? (
-                <div className="flex items-center gap-1">
-                  <button
-                    type="button"
-                    onClick={() => void onDelete(d.name)}
-                    disabled={deletingName === d.name}
-                    className="inline-flex h-7 items-center gap-1 rounded-md px-2 text-[11.5px] font-medium text-red-600 transition-colors hover:bg-red-50 disabled:opacity-60 dark:text-red-400 dark:hover:bg-red-500/10"
-                  >
-                    {deletingName === d.name && <Loader2 className="h-3 w-3 animate-spin" />}
-                    {t('docs.delete.confirm')}
-                  </button>
-                  <button type="button" onClick={() => onConfirmDelete(null)} className="h-7 rounded-md px-2 text-[11.5px] text-muted-foreground hover:bg-accent">
-                    {t('docs.delete.cancel')}
-                  </button>
-                </div>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => onConfirmDelete(d.name)}
-                  title={t('docs.delete.action')}
-                  aria-label={t('docs.delete.action')}
-                  className="grid h-7 w-7 place-items-center rounded-lg text-muted-foreground opacity-0 transition-all hover:bg-red-50 hover:text-red-600 group-hover:opacity-100 focus:opacity-100 dark:hover:bg-red-500/10 dark:hover:text-red-400"
-                >
-                  <Trash2 className="h-3.5 w-3.5" />
-                </button>
-              ))}
-            </div>
-          </div>
-        ))}
-      </div>
-    </section>
   )
 }
 

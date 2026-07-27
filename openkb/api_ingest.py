@@ -115,7 +115,18 @@ def start_add_job(
             "endpoint": "add",
             "kb": kb,
             "file_count": len(saved_uploads),
-            "steps_per_file": 3,
+            "steps_per_file": 4,
+        },
+    )
+    job.record(
+        "log",
+        {
+            "level": "info",
+            "logger": __name__,
+            "message": (
+                f"Accepted {len(saved_uploads)} file(s); compilation will run serially "
+                "to protect this knowledge base."
+            ),
         },
     )
     registry.submit(
@@ -146,18 +157,38 @@ async def run_add_worker(
     token = cancel_event_var.set(job.cancel_event)
     results: list[AddFileItem] = []
     try:
+        job.record(
+            "log",
+            {
+                "level": "info",
+                "logger": __name__,
+                "message": f"Worker started for {len(saved_uploads)} file(s).",
+            },
+        )
         for file_index, (saved_path, original_name) in enumerate(saved_uploads):
             if job.cancelled:
                 raise IngestCancelled("ingest cancelled by user")
             context = {"file_index": file_index, "original_name": original_name}
+            file_size = saved_path.stat().st_size if saved_path.exists() else 0
             job.record("uploaded", {**context, "saved_path": str(saved_path)})
+            job.record(
+                "log",
+                {
+                    "level": "info",
+                    "logger": __name__,
+                    "message": (
+                        f"[{file_index + 1}/{len(saved_uploads)}] Received "
+                        f"{original_name} ({file_size:,} bytes)."
+                    ),
+                },
+            )
             job.record(
                 "file_start",
                 {
                     **context,
                     "saved_path": str(saved_path),
                     "completed_steps": 0,
-                    "total_steps": 3,
+                    "total_steps": 4,
                     "step": "prepare",
                 },
             )
@@ -166,9 +197,9 @@ async def run_add_worker(
                 {
                     **context,
                     "completed_steps": 1,
-                    "total_steps": 3,
+                    "total_steps": 4,
                     "step": "prepare",
-                    "message": "Source file is ready for compilation.",
+                    "message": "Upload stored; preparing source conversion.",
                 },
             )
             job.record(
@@ -176,7 +207,20 @@ async def run_add_worker(
                 {
                     "level": "info",
                     "logger": __name__,
-                    "message": f"{original_name}: starting conversion, indexing, and compilation.",
+                    "message": (
+                        f"{original_name}: source conversion started; live compiler events "
+                        "will follow."
+                    ),
+                },
+            )
+            job.record(
+                "file_progress",
+                {
+                    **context,
+                    "completed_steps": 2,
+                    "total_steps": 4,
+                    "step": "compile",
+                    "message": "Converting source and compiling knowledge-base pages.",
                 },
             )
             try:
@@ -195,7 +239,7 @@ async def run_add_worker(
                         "status": "cancelled",
                         "message": "Cancelled by user",
                         "completed_steps": 1,
-                        "total_steps": 3,
+                        "total_steps": 4,
                         "step": "compile",
                     },
                 )
@@ -206,8 +250,8 @@ async def run_add_worker(
                 "file_progress",
                 {
                     **context,
-                    "completed_steps": 3 if item.status in {"added", "skipped"} else 2,
-                    "total_steps": 3,
+                    "completed_steps": 4 if item.status in {"added", "skipped"} else 2,
+                    "total_steps": 4,
                     "step": "finalize" if item.status in {"added", "skipped"} else "compile",
                     "message": item.message,
                 },
@@ -225,12 +269,24 @@ async def run_add_worker(
                 {
                     **payload,
                     **context,
-                    "completed_steps": 3 if item.status in {"added", "skipped"} else 2,
-                    "total_steps": 3,
+                    "completed_steps": 4 if item.status in {"added", "skipped"} else 2,
+                    "total_steps": 4,
                     "step": "finalize" if item.status in {"added", "skipped"} else "compile",
                 },
             )
-        return _model_payload(_summarize_add_results(kb, results))
+        summary = _summarize_add_results(kb, results)
+        job.record(
+            "log",
+            {
+                "level": "info",
+                "logger": __name__,
+                "message": (
+                    f"Batch complete: {summary.added_count} compiled, "
+                    f"{summary.skipped_count} skipped, {summary.failed_count} failed."
+                ),
+            },
+        )
+        return _model_payload(summary)
     finally:
         cancel_event_var.reset(token)
         logging.getLogger(_OPENKB_LOGGER_NAME).removeHandler(handler)

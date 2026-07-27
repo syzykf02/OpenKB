@@ -8,16 +8,19 @@ import {
   ListTree,
   Loader2,
   RotateCcw,
+  Trash2,
   XCircle,
 } from 'lucide-react'
-import type { WikiDocument } from '@/api/wiki'
+import type { PendingDocument, WikiDocument } from '@/api/wiki'
 import type { CompileTaskFile, UploadFileState, UploadLogLine, UploadStatus } from '@/hooks/useJobs'
 import { cn } from '@/lib/utils'
 
 function UploadStatusIcon({ status }: { status: UploadStatus }) {
   switch (status) {
+    case 'uploading':
     case 'processing':
       return <Loader2 className="h-4 w-4 animate-spin text-accent-brand" />
+    case 'uploaded':
     case 'added':
       return <CheckCircle2 className="h-4 w-4 text-emerald-500 dark:text-emerald-400" />
     case 'skipped':
@@ -62,11 +65,18 @@ function LogLine({ line }: { line: UploadLogLine }) {
 export interface JobsPanelProps {
   taskFiles: CompileTaskFile[]
   documents: WikiDocument[]
+  pendingDocuments: PendingDocument[]
   selectedLogs: UploadLogLine[]
-  selectedRunning: boolean
-  selectedCancelling: boolean
-  onCancelUpload: () => void
+  cancellingJobIds: ReadonlySet<string>
+  onCancelFile: (file: CompileTaskFile) => void
   onRetryFile: (file: CompileTaskFile) => void
+  onCompilePendingFile: (document: PendingDocument) => void
+  onPreviewDocument: (document: WikiDocument) => void
+  recompilingDocumentNames: ReadonlySet<string>
+  onRecompileDocument: (document: WikiDocument) => void
+  onRequestDeleteDocument: (document: WikiDocument) => void
+  onRequestDeletePending: (document: PendingDocument) => void
+  deletingDocumentName: string | null
 }
 
 /** File-first compile workspace. Live, retained, and already-compiled files
@@ -74,34 +84,91 @@ export interface JobsPanelProps {
 export default function JobsPanel({
   taskFiles,
   documents,
+  pendingDocuments,
   selectedLogs,
-  selectedRunning,
-  selectedCancelling,
-  onCancelUpload,
+  cancellingJobIds,
+  onCancelFile,
   onRetryFile,
+  onCompilePendingFile,
+  onPreviewDocument,
+  recompilingDocumentNames,
+  onRecompileDocument,
+  onRequestDeleteDocument,
+  onRequestDeletePending,
+  deletingDocumentName,
 }: JobsPanelProps) {
   const { t } = useTranslation(['kb', 'common'])
   const logRef = useRef<HTMLDivElement>(null)
-  const finishedNames = new Set(
-    taskFiles
-      .filter((file) => file.status === 'added')
+  const documentsByName = new Map(documents.map((document) => [document.name, document]))
+  const documentsByHash = new Map(documents.map((document) => [document.hash, document]))
+  const pendingByPath = new Map(pendingDocuments.map((document) => [document.path, document]))
+  const pendingByName = new Map(pendingDocuments.map((document) => [document.name, document]))
+  // Jobs are newest-first. Keep only the latest state for a filename so a
+  // failed attempt followed by a retry does not create multiple source rows.
+  const latestTaskFiles = taskFiles.filter(
+    (file, index, all) => all.findIndex((candidate) => candidate.name === file.name) === index,
+  )
+  const representedNames = new Set(
+    latestTaskFiles
+      .filter((file) => file.status === 'added' || file.status === 'exists')
       .map((file) => file.name),
   )
+  const representedHashes = new Set(
+    latestTaskFiles
+      .filter((file) => file.status === 'added' || file.status === 'exists')
+      .map((file) => file.sourceHash)
+      .filter((hash): hash is string => !!hash),
+  )
   const completedFiles: CompileTaskFile[] = documents
-    .filter((document) => !finishedNames.has(document.name))
+    .filter((document) => !representedNames.has(document.name) && !representedHashes.has(document.hash))
     .map((document) => ({
       id: `document:${document.hash || document.name}`,
       name: document.name,
+      sourceHash: document.hash,
       status: 'added',
       message: document.display_type,
       uploadIndex: null,
-      completedSteps: 3,
-      totalSteps: 3,
+      completedSteps: 4,
+      totalSteps: 4,
       step: 'finalize',
       jobId: '',
+      jobStatus: 'done',
       createdAt: 0,
     }))
-  const files = [...taskFiles, ...completedFiles]
+  // A successful task already represents its source. Once that source has
+  // been removed, omit its historical success row as well: this surface is a
+  // source inventory, not a permanent audit log. Failed/cancelled work stays
+  // visible so it can be retried or explained by the live log.
+  const sourceTasks = latestTaskFiles.filter(
+    (file) => file.status !== 'added' || documentsByName.has(file.name),
+  )
+  const activePendingPaths = new Set(
+    sourceTasks
+      .filter((file) => file.sourcePath && file.jobId)
+      .map((file) => file.sourcePath),
+  )
+  const pendingFiles: CompileTaskFile[] = pendingDocuments
+    .filter(
+      (document) =>
+        !documentsByName.has(document.name) &&
+        !activePendingPaths.has(document.path) &&
+        !sourceTasks.some((file) => file.name === document.name),
+    )
+    .map((document) => ({
+      id: `pending:${document.path}`,
+      name: document.name,
+      sourcePath: document.path,
+      status: 'uploaded',
+      message: document.display_type,
+      uploadIndex: null,
+      completedSteps: 1,
+      totalSteps: 4,
+      step: 'prepare',
+      jobId: '',
+      jobStatus: 'done',
+      createdAt: 0,
+    }))
+  const files = [...sourceTasks, ...completedFiles, ...pendingFiles]
 
   useEffect(() => {
     const element = logRef.current
@@ -115,17 +182,6 @@ export default function JobsPanel({
           <h3 className="text-[14px] font-semibold text-foreground">{t('jobs.heading', { count: files.length })}</h3>
           <p className="mt-1 text-[12px] text-muted-foreground">{t('jobs.fileFirstNote')}</p>
         </div>
-        {selectedRunning && (
-          <button
-            type="button"
-            onClick={onCancelUpload}
-            disabled={selectedCancelling}
-            className="inline-flex h-7 items-center gap-1.5 rounded-lg px-2 text-[11.5px] font-medium text-muted-foreground transition-colors hover:bg-red-50 hover:text-red-600 disabled:cursor-wait disabled:opacity-60 dark:hover:bg-red-500/10 dark:hover:text-red-400"
-          >
-            {selectedCancelling ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Ban className="h-3.5 w-3.5" />}
-            {selectedCancelling ? t('upload.cancelling') : t('upload.cancel')}
-          </button>
-        )}
       </div>
 
       {files.length === 0 ? (
@@ -138,28 +194,107 @@ export default function JobsPanel({
                   <h4 className="text-[12px] font-semibold text-muted-foreground">{t('upload.progressHeading', { count: files.length })}</h4>
                 </div>
                 <div className="max-h-[420px] overflow-y-auto border-b border-[hsl(var(--glass-border))]">
-                  {files.map((file) => (
+                  {files.map((file) => {
+                    const document = documentsByName.get(file.name) || (file.sourceHash ? documentsByHash.get(file.sourceHash) : undefined)
+                    const pendingDocument = file.sourcePath
+                      ? pendingByPath.get(file.sourcePath)
+                      : pendingByName.get(file.name)
+                    const recompiling = !!document && recompilingDocumentNames.has(document.name)
+                    const activeJob =
+                      !!file.jobId && (file.jobStatus === 'queued' || file.jobStatus === 'running')
+                    const displayFile = recompiling
+                      ? { ...file, status: 'processing' as UploadStatus, completedSteps: 2, totalSteps: 4, step: 'compile' }
+                      : file
+                    return (
                       <div key={file.id} className="group flex items-center gap-2 border-b border-[hsl(var(--glass-border))] py-2.5 last:border-b-0">
                         <div className="flex min-w-0 flex-1 items-center gap-2.5">
-                          <UploadStatusIcon status={file.status} />
+                          <UploadStatusIcon status={displayFile.status} />
                           <span className="min-w-0 flex-1">
-                            <span className="block truncate text-[12.5px] font-medium text-foreground">{file.name}</span>
-                            <span className="mt-0.5 block truncate text-[10.5px] text-muted-foreground">{file.message || t(`jobs.steps.${file.step}`)}</span>
+                            {document ? (
+                              <button
+                                type="button"
+                                onClick={() => onPreviewDocument(document)}
+                                title={t('docs.reader.open')}
+                                className="block max-w-full truncate text-left text-[12.5px] font-medium text-foreground transition-colors hover:text-accent-brand hover:underline focus:outline-none focus-visible:rounded focus-visible:ring-2 focus-visible:ring-accent-brand/50"
+                              >
+                                {file.name}
+                              </button>
+                            ) : (
+                              <span className="block truncate text-[12.5px] font-medium text-foreground">{file.name}</span>
+                            )}
+                            <span className="mt-0.5 block truncate text-[10.5px] text-muted-foreground">{recompiling ? t('jobs.steps.compile') : file.message || t(`jobs.steps.${file.step}`)}</span>
                           </span>
-                          <FileStatus file={file} />
+                          <FileStatus file={displayFile} />
                         </div>
-                        {file.status === 'failed' && file.uploadIndex != null && file.jobId && (
-                          <button
-                            type="button"
-                            onClick={() => onRetryFile(file)}
-                            className="inline-flex h-7 shrink-0 items-center gap-1 rounded-md px-2 text-[11px] font-medium text-red-600 transition-colors hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-500/10"
-                          >
-                            <RotateCcw className="h-3 w-3" />
-                            {t('upload.retry')}
-                          </button>
-                        )}
+                        <div className="flex shrink-0 items-center gap-1">
+                          {!activeJob && file.status === 'failed' && file.uploadIndex != null && file.jobId ? (
+                            <button
+                              type="button"
+                              onClick={() => onRetryFile(file)}
+                              className="inline-flex h-7 items-center gap-1 rounded-md px-2 text-[11px] font-medium text-red-600 transition-colors hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-500/10"
+                            >
+                              <RotateCcw className="h-3 w-3" />
+                              {t('upload.compile')}
+                            </button>
+                          ) : !activeJob && document ? (
+                            <button
+                              type="button"
+                              onClick={() => onRecompileDocument(document)}
+                              disabled={recompiling}
+                              className="inline-flex h-7 items-center gap-1 rounded-md px-2 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:cursor-wait disabled:opacity-60"
+                            >
+                              {recompiling ? <Loader2 className="h-3 w-3 animate-spin" /> : <RotateCcw className="h-3 w-3" />}
+                              {t('upload.compile')}
+                            </button>
+                          ) : !activeJob && pendingDocument ? (
+                            <button
+                              type="button"
+                              onClick={() => onCompilePendingFile(pendingDocument)}
+                              className="inline-flex h-7 items-center gap-1 rounded-md px-2 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                            >
+                              <RotateCcw className="h-3 w-3" />
+                              {t('upload.compile')}
+                            </button>
+                          ) : null}
+                          {document && (
+                            <button
+                              type="button"
+                              onClick={() => onRequestDeleteDocument(document)}
+                              disabled={recompiling || deletingDocumentName === document.name}
+                              title={t('docs.delete.action')}
+                              aria-label={t('docs.delete.action')}
+                              className="grid h-7 w-7 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-red-50 hover:text-red-600 disabled:cursor-wait disabled:opacity-60 dark:hover:bg-red-500/10 dark:hover:text-red-400"
+                            >
+                              {deletingDocumentName === document.name ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
+                            </button>
+                          )}
+                          {!activeJob && !document && pendingDocument && (
+                            <button
+                              type="button"
+                              onClick={() => onRequestDeletePending(pendingDocument)}
+                              disabled={deletingDocumentName === pendingDocument.name}
+                              title={t('docs.delete.action')}
+                              aria-label={t('docs.delete.action')}
+                              className="grid h-7 w-7 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-red-50 hover:text-red-600 disabled:cursor-wait disabled:opacity-60 dark:hover:bg-red-500/10 dark:hover:text-red-400"
+                            >
+                              {deletingDocumentName === pendingDocument.name ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
+                            </button>
+                          )}
+                          {activeJob && (
+                            <button
+                              type="button"
+                              onClick={() => onCancelFile(file)}
+                              disabled={cancellingJobIds.has(file.jobId)}
+                              className="inline-flex h-7 items-center gap-1 rounded-md px-2 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-red-50 hover:text-red-600 disabled:cursor-wait disabled:opacity-60 dark:hover:bg-red-500/10 dark:hover:text-red-400"
+                            >
+                              {cancellingJobIds.has(file.jobId) ? <Loader2 className="h-3 w-3 animate-spin" /> : <Ban className="h-3 w-3" />}
+                              {cancellingJobIds.has(file.jobId) ? t('upload.cancelling') : t('upload.cancel')}
+                            </button>
+                          )}
+                        </div>
                       </div>
-                  ))}
+                    )
+                  })}
                 </div>
               </section>
 

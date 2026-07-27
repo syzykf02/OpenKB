@@ -20,14 +20,18 @@
     "inProgress": "Uploading and compiling…",
     "dropzone": "Drop files here, or click to choose",
     "dropzoneHint": "PDF / Word / Markdown / text and more; multi-select supported",
-    "progressHeading": "Upload progress · {{count}}",
-    "cancel": "Cancel",
+    "progressHeading": "Local sources · {{count}}",
+    "cancel": "Cancel task",
     "cancelling": "Cancelling…",
+    "compile": "Compile",
+    "recompile": "Recompile",
     "retry": "Retry",
     "cancelledToast": "Compile cancelled — the in-flight file was rolled back",
     "logHeading": "Compile log",
     "logEmpty": "No log entries yet. Live updates will appear here when the task starts.",
     "fileStatus": {
+      "uploading": "Uploading…",
+      "uploaded": "Uploaded",
       "pending": "Waiting",
       "processing": "Compiling…",
       "added": "Compiled",
@@ -38,12 +42,12 @@
     }
   },
   "jobs": {
-    "heading": "Compile jobs · {{count}}",
-    "empty": "No compile jobs yet",
+    "heading": "Knowledge sources · {{count}}",
+    "empty": "No knowledge sources yet",
     "selectHint": "Select a job to view its files and log",
     "filesLabel": "{{count}} file(s)",
     "allExist": "All {{count}} file(s) are already in the KB - nothing uploaded",
-    "fileFirstNote": "Upload starts compilation immediately; each file shows its own progress and result.",
+    "fileFirstNote": "Each local source stays here with its current state and available actions.",
     "stepCount": "{{completed}} / {{total}} steps",
     "steps": {
       "prepare": "Preparing source",
@@ -123,11 +127,11 @@
     "eyebrow": "Document workspace",
     "title": "Manage knowledge sources",
     "addFiles": "Add files",
-    "createTask": "Create a compile task",
+    "createTask": "Add local sources",
     "createTaskNote": "Files are parsed and compiled into this knowledge base automatically.",
     "libraryNote": "Review source documents or remove sources you no longer need.",
     "tabs": {
-      "jobs": "Compile jobs",
+      "jobs": "Local sources",
       "documents": "Uploaded documents",
       "remote": "Remote sources"
     }

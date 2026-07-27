@@ -4,6 +4,7 @@ import type { TFunction } from 'i18next'
 import { toast } from 'sonner'
 import {
   cancelJob,
+  compilePendingDocument,
   listJobs,
   retryJobFile,
   startUpload,
@@ -12,15 +13,25 @@ import {
   type JobSummary,
   type UploadEvent,
 } from '@/api/maintenance'
+import type { PendingDocument } from '@/api/wiki'
 
-/** Per-file lifecycle during an upload. `pending` -> `processing` (backend
+/** Per-file lifecycle during an upload. `uploading` -> `processing` (backend
  *  `file_start`) -> terminal `added`/`skipped`/`failed` (`file_done`), or
  *  `cancelled` when the user aborts the batch mid-upload (the server rolls the
  *  in-flight file back). `exists` is client-only: a duplicate whose hash was
  *  already in the KB, deduped before upload (never sent). Such rows exist only
  *  in the session that performed the upload; after a refresh only the
  *  server-processed files replay from the job's event ring. */
-export type UploadStatus = 'pending' | 'processing' | 'added' | 'skipped' | 'exists' | 'failed' | 'cancelled'
+export type UploadStatus =
+  | 'uploading'
+  | 'uploaded'
+  | 'pending'
+  | 'processing'
+  | 'added'
+  | 'skipped'
+  | 'exists'
+  | 'failed'
+  | 'cancelled'
 
 export interface UploadFileState {
   /** Stable generated id, assigned once at seed time - the React key. Rows are
@@ -28,6 +39,13 @@ export interface UploadFileState {
    *  (two same-basename files from different folders must not collide). */
   id: string
   name: string
+  /** SHA-256 of a client-deduped source. It lets the UI resolve a duplicate
+   * upload back to its canonical KB document even if the local filename has
+   * changed. Worker-driven rows omit it because their document does not exist
+   * until compilation completes. */
+  sourceHash?: string
+  /** Safe basename of a raw source awaiting its first compilation. */
+  sourcePath?: string
   status: UploadStatus
   message?: string
   /** Position within the uploaded batch (the files actually sent), or `null`
@@ -50,6 +68,7 @@ export interface UploadLogLine {
 /** One file in the all-history compile list, annotated with its source job. */
 export interface CompileTaskFile extends UploadFileState {
   jobId: string
+  jobStatus: JobSummary['status']
   createdAt: number
 }
 
@@ -140,20 +159,21 @@ export interface UseJobsResult {
   /** True while any job is non-terminal (queued/running) - drives the dropzone
    *  disabled state and the "compiling" indicator. */
   uploading: boolean
-  /** True when the SELECTED job is non-terminal - drives the Cancel button. */
-  selectedRunning: boolean
-  /** True after this client has asked the server to cancel the selected job. */
-  selectedCancelling: boolean
   /** Select a job to view its files + log. Re-attaches the SSE stream (replays
    *  history from the ring, then tails live if still running). */
   selectJob: (id: string | null) => void
   /** Hash each file client-side, skip duplicates already in the KB, upload the
    *  rest as a new server-owned job, and auto-select it. */
   doUpload: (files: File[]) => void
-  /** Cancel the selected job (cooperative; the in-flight mutation rolls back). */
-  cancelUpload: () => void
+  /** Cancel a file's containing job (cooperative; the in-flight mutation rolls back). */
+  cancelFile: (file: CompileTaskFile) => void
+  /** Job ids with an in-flight cancellation request. */
+  cancellingJobIds: ReadonlySet<string>
   /** Re-run one failed file from its retained source file. */
   retryFile: (file: CompileTaskFile) => void
+  /** Start compilation for a source that was uploaded previously and is still
+   * present in the KB's raw directory. */
+  compilePendingFile: (document: PendingDocument) => void
 }
 
 /**
@@ -178,6 +198,9 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
 
   const [serverJobs, setServerJobs] = useState<JobSummary[]>([])
   const [jobData, setJobData] = useState<Record<string, JobData>>({})
+  // Files deduped in the browser never create a server job, but still belong
+  // in the visible task list so the user can see why they were not uploaded.
+  const [clientOnlyFiles, setClientOnlyFiles] = useState<CompileTaskFile[]>([])
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null)
   const [cancellingJobIds, setCancellingJobIds] = useState<Set<string>>(new Set())
 
@@ -191,12 +214,9 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
   onCompletedRef.current = opts.onCompleted
   const serverJobsRef = useRef<JobSummary[]>([])
   serverJobsRef.current = serverJobs
-  const selectedJobIdRef = useRef<string | null>(selectedJobId)
-  selectedJobIdRef.current = selectedJobId
-
   // The job whose SSE stream is currently open (the selected one), and the
   // AbortController that detaches THIS view on switch/unmount (the job keeps
-  // running server-side until it finishes or is cancelled via cancelUpload).
+  // running server-side until it finishes or is cancelled explicitly).
   const attachAbortRef = useRef<AbortController | null>(null)
   // The job whose completion fires a toast - the one THIS session started via
   // doUpload. Restored history from a refresh replays silently.
@@ -215,7 +235,32 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
    *  matched by `uploadIndex`; an event whose index has no seeded row (replay
    *  after a refresh, when client-deduped rows are gone) appends one. */
   const applyJobEvent = useCallback((jobId: string, ev: UploadEvent) => {
-    if (ev.type === 'file_start') {
+    if (ev.type === 'uploaded') {
+      setJobData((prev) => {
+        const cur = prev[jobId] ?? { files: [], logs: [] }
+        const idx = cur.files.findIndex((file) => file.uploadIndex === ev.index)
+        const files =
+          idx >= 0
+            ? cur.files.map((file, index) =>
+                index === idx
+                  ? { ...file, status: 'uploaded' as UploadStatus, step: 'prepare' }
+                  : file,
+              )
+            : [
+                ...cur.files,
+                {
+                  id: String(rowIdSeq.current++),
+                  name: ev.original_name,
+                  status: 'uploaded' as UploadStatus,
+                  uploadIndex: ev.index,
+                  completedSteps: 0,
+                  totalSteps: 4,
+                  step: 'prepare',
+                },
+              ]
+        return { ...prev, [jobId]: { ...cur, files } }
+      })
+    } else if (ev.type === 'file_start') {
       setJobData((prev) => {
         const cur = prev[jobId] ?? { files: [], logs: [] }
         const idx = cur.files.findIndex((f) => f.uploadIndex === ev.index)
@@ -227,7 +272,7 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
                       ...f,
                       status: 'processing' as UploadStatus,
                       completedSteps: ev.completed_steps ?? 0,
-                      totalSteps: ev.total_steps || f.totalSteps || 3,
+                      totalSteps: ev.total_steps || f.totalSteps || 4,
                       step: ev.step ?? 'prepare',
                     }
                   : f,
@@ -240,7 +285,7 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
                   status: 'processing' as UploadStatus,
                   uploadIndex: ev.index,
                   completedSteps: ev.completed_steps ?? 0,
-                  totalSteps: ev.total_steps || 3,
+                  totalSteps: ev.total_steps || 4,
                   step: ev.step ?? 'prepare',
                 },
               ]
@@ -275,8 +320,8 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
                       ...f,
                       status,
                       message: ev.file.message,
-                      completedSteps: ev.completed_steps ?? (status === 'added' || status === 'skipped' ? 3 : f.completedSteps),
-                      totalSteps: ev.total_steps || f.totalSteps || 3,
+                      completedSteps: ev.completed_steps ?? (status === 'added' || status === 'skipped' ? 4 : f.completedSteps),
+                      totalSteps: ev.total_steps || f.totalSteps || 4,
                       step: ev.step ?? (status === 'added' || status === 'skipped' ? 'finalize' : f.step),
                     }
                   : f,
@@ -289,8 +334,8 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
                   status,
                   message: ev.file.message,
                   uploadIndex: ev.index,
-                  completedSteps: ev.completed_steps ?? (status === 'added' || status === 'skipped' ? 3 : 0),
-                  totalSteps: ev.total_steps || 3,
+                  completedSteps: ev.completed_steps ?? (status === 'added' || status === 'skipped' ? 4 : 0),
+                  totalSteps: ev.total_steps || 4,
                   step: ev.step ?? (status === 'added' || status === 'skipped' ? 'finalize' : 'compile'),
                 },
               ]
@@ -311,7 +356,7 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
       setJobData((prev) => {
         const cur = prev[jobId] ?? { files: [], logs: [] }
         const files = cur.files.map((f) =>
-          f.status === 'pending' || f.status === 'processing'
+          f.status === 'uploading' || f.status === 'uploaded' || f.status === 'pending' || f.status === 'processing'
             ? { ...f, status: 'cancelled' as UploadStatus }
             : f,
         )
@@ -394,6 +439,7 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
   useEffect(() => {
     let stale = false
     setJobData({})
+    setClientOnlyFiles([])
     setServerJobs([])
     setSelectedJobId(null)
     setCancellingJobIds(new Set())
@@ -460,15 +506,15 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
       // KB's known document hashes. A hash failure (no SubtleCrypto) degrades to
       // "upload anyway" - the server dedups.
       const known = knownHashesRef.current()
-      const hashed: { file: File; known: boolean }[] = []
+      const hashed: { file: File; hash: string; known: boolean }[] = []
       for (const f of files) {
         const hash = await sha256Hex(f)
-        hashed.push({ file: f, known: !!hash && known.has(hash) })
+        hashed.push({ file: f, hash, known: !!hash && known.has(hash) })
       }
       const toUpload = hashed.filter((h) => !h.known).map((h) => h.file)
 
       // Seed one row per dropped file in selection order: client-deduped files
-      // show `exists` immediately (never sent); the rest are `pending` with an
+      // show `exists` immediately (never sent); the rest are `uploading` with an
       // uploadIndex that correlates them to the job's file_start/file_done.
       let uploadIdx = 0
       const rows: UploadFileState[] = hashed.map((h) =>
@@ -476,25 +522,31 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
           ? {
               id: String(rowIdSeq.current++),
               name: h.file.name,
+              sourceHash: h.hash,
               status: 'exists',
               uploadIndex: null,
-              completedSteps: 3,
-              totalSteps: 3,
+              completedSteps: 4,
+              totalSteps: 4,
               step: 'finalize',
             }
           : {
               id: String(rowIdSeq.current++),
               name: h.file.name,
-              status: 'pending',
+              status: 'uploading',
               uploadIndex: uploadIdx++,
               completedSteps: 0,
-              totalSteps: 3,
+              totalSteps: 4,
               step: 'prepare',
             },
       )
 
       if (toUpload.length === 0) {
         // Every dropped file is already in the KB - nothing to send.
+        const createdAt = Date.now() / 1000
+        setClientOnlyFiles((previous) => [
+          ...rows.map((row) => ({ ...row, jobId: '', jobStatus: 'done' as const, createdAt })),
+          ...previous,
+        ])
         toast.info(tRef.current('kb:jobs.allExist', { count: files.length }))
         onCompletedRef.current()
         return
@@ -538,10 +590,10 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
     [kb, selectJob],
   )
 
-  const cancelUpload = useCallback(() => {
-    const id = selectedJobIdRef.current
+  const cancelFile = useCallback((file: CompileTaskFile) => {
+    const id = file.jobId
     if (!id) return
-    const job = serverJobsRef.current.find((j) => j.id === id)
+    const job = serverJobsRef.current.find((candidate) => candidate.id === id)
     if (!job || isTerminal(job)) return
     setCancellingJobIds((ids) => new Set(ids).add(id))
     cancelJob(id).catch((e) => {
@@ -569,10 +621,10 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
       const row: UploadFileState = {
         id: String(rowIdSeq.current++),
         name: file.name,
-        status: 'pending',
+        status: 'uploading',
         uploadIndex: 0,
         completedSteps: 0,
-        totalSteps: 3,
+        totalSteps: 4,
         step: 'prepare',
       }
       setServerJobs((prev) => [
@@ -600,8 +652,53 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
     [kb, selectJob],
   )
 
+  const compilePendingFile = useCallback(
+    async (document: PendingDocument) => {
+      let accepted: { job_id: string; status: string }
+      try {
+        accepted = await compilePendingDocument(kb, document)
+      } catch (e) {
+        toast.error(errMsg(e))
+        return
+      }
+      const jobId = accepted.job_id
+      const row: UploadFileState = {
+        id: String(rowIdSeq.current++),
+        name: document.name,
+        sourcePath: document.path,
+        status: 'uploaded',
+        uploadIndex: 0,
+        completedSteps: 1,
+        totalSteps: 4,
+        step: 'prepare',
+      }
+      setServerJobs((prev) => [
+        ...prev,
+        {
+          id: jobId,
+          kind: 'add',
+          kb,
+          title: `compile: ${document.name}`,
+          status: accepted.status as JobSummary['status'],
+          created_at: Date.now() / 1000,
+          started_at: null,
+          finished_at: null,
+          result: null,
+          error: null,
+          last_seq: -1,
+        },
+      ])
+      prevStatusRef.current[jobId] = accepted.status as JobSummary['status']
+      setJobData((prev) => ({ ...prev, [jobId]: { files: [row], logs: [] } }))
+      notifyJobIdRef.current = jobId
+      notifiedRef.current.delete(jobId)
+      selectJob(jobId)
+    },
+    [kb, selectJob],
+  )
+
   const taskFiles = useMemo(() => {
-    const files: CompileTaskFile[] = []
+    const files: CompileTaskFile[] = [...clientOnlyFiles]
     for (const job of serverJobs) {
       if (job.kind !== 'add') continue
       const streamed = jobData[job.id]?.files
@@ -613,30 +710,34 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
             status: file.status as UploadStatus,
             message: file.message,
             uploadIndex: index,
-            completedSteps: file.status === 'added' || file.status === 'skipped' ? 3 : 2,
-            totalSteps: 3,
+            completedSteps: file.status === 'added' || file.status === 'skipped' ? 4 : 2,
+            totalSteps: 4,
             step: file.status === 'added' || file.status === 'skipped' ? 'finalize' : 'compile',
           }))
-      files.push(...source.map((file) => ({ ...file, jobId: job.id, createdAt: job.created_at })))
+      files.push(
+        ...source.map((file) => ({
+          ...file,
+          jobId: job.id,
+          jobStatus: job.status,
+          createdAt: job.created_at,
+        })),
+      )
     }
     return files.sort((a, b) => b.createdAt - a.createdAt)
-  }, [jobData, serverJobs])
+  }, [clientOnlyFiles, jobData, serverJobs])
 
   const selectedData = selectedJobId ? jobData[selectedJobId] : undefined
-  const selectedRunning = !!selectedJobId && !!serverJobs.find((j) => j.id === selectedJobId && !isTerminal(j))
-  const selectedCancelling = !!selectedJobId && cancellingJobIds.has(selectedJobId)
-
   return {
     jobs: serverJobs,
     selectedJobId,
     taskFiles,
     selectedLogs: selectedData?.logs ?? [],
     uploading: hasActive,
-    selectedRunning,
-    selectedCancelling,
     selectJob,
     doUpload,
-    cancelUpload,
+    cancelFile,
+    cancellingJobIds,
     retryFile,
+    compilePendingFile,
   }
 }

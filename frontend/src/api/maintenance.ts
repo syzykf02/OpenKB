@@ -1,5 +1,6 @@
 import { apiFetch, apiStream, getToken, getApiBase } from "./client"
 import i18n from "@/lib/i18n"
+import type { PendingDocument } from "@/api/wiki"
 
 /** One file's outcome in an `/api/v1/add` response (`AddFileItem`). */
 export interface AddFileItem {
@@ -47,6 +48,13 @@ export interface WatchStatus {
  * away here; `done` terminates the stream.
  */
 export type UploadEvent =
+  | {
+      /** Upload request accepted and this source has been written to the
+       * server-side staging area. Conversion has not started yet. */
+      type: "uploaded"
+      index: number
+      original_name: string
+    }
   | {
       type: "file_start"
       index: number
@@ -161,6 +169,27 @@ export function retryJobFile(
   })
 }
 
+/** Start a re-attachable add job for a source that is already saved in the
+ * knowledge base's local `raw/` directory. */
+export function compilePendingDocument(
+  kb: string,
+  document: PendingDocument,
+): Promise<{ job_id: string; kb: string; status: string }> {
+  return apiFetch<{ job_id: string; kb: string; status: string }>("/api/v1/documents/compile", {
+    body: { kb, path: document.path },
+  })
+}
+
+/** Permanently remove one uploaded source that has not been compiled yet. */
+export function deletePendingDocument(
+  kb: string,
+  document: PendingDocument,
+): Promise<{ status: string; name: string }> {
+  return apiFetch<{ status: string; name: string }>("/api/v1/documents/pending/delete", {
+    body: { kb, path: document.path },
+  })
+}
+
 /**
  * Tail one job's SSE event stream, calling `onEvent` per frame. Re-attachable:
  * frames carry monotonic SSE `id:` cursors; pass `lastSeq` to resume after the
@@ -216,6 +245,13 @@ export async function streamJobEvents(
         continue // robust SSE reader: skip a malformed frame, keep streaming
       }
       switch (event) {
+        case "uploaded":
+          onEvent({
+            type: "uploaded",
+            index: Number.isInteger(data.file_index) ? data.file_index : fileCursor + 1,
+            original_name: String(data.original_name ?? ""),
+          })
+          break
         case "file_start":
           fileCursor = Number.isInteger(data.file_index) ? data.file_index : fileCursor + 1
           onEvent({
@@ -267,7 +303,7 @@ export async function streamJobEvents(
         case "done":
           onEvent({ type: "done", status: String(data.status ?? "") })
           break
-        // `start` / `uploaded` carry no per-file UI signal.
+        // `start` carries no per-file UI signal.
       }
     }
   }

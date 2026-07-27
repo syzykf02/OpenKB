@@ -24,6 +24,16 @@ export interface WikiDocument {
   pages: number | null
 }
 
+/** A local file already stored in `raw/` but not yet registered in the KB.
+ * `path` is the server-validated basename used to resume compilation. */
+export interface PendingDocument {
+  path: string
+  name: string
+  type: string
+  display_type: string
+  size_bytes: number
+}
+
 /**
  * The `/api/v1/list` response (`openkb.cli.get_kb_list` → `ListResponse`).
  *
@@ -33,6 +43,7 @@ export interface WikiDocument {
  */
 export interface KbInventory {
   documents: WikiDocument[]
+  pending_documents: PendingDocument[]
   document_count: number
   summaries: string[]
   concepts: string[]

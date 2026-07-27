@@ -147,13 +147,31 @@ class DocumentItem(BaseModel):
     pages: int | None = None
 
 
+class PendingDocumentItem(BaseModel):
+    """A local raw source that was uploaded but is not indexed yet."""
+
+    path: str
+    name: str
+    type: str
+    display_type: str
+    size_bytes: int
+
+
 class ListResponse(BaseModel):
     documents: list[DocumentItem]
+    pending_documents: list[PendingDocumentItem] = []
     document_count: int
     summaries: list[str]
     concepts: list[str]
     entities: list[str]
     reports: list[str]
+
+
+class CompilePendingDocumentRequest(BaseModel):
+    """Start compiling one already-uploaded raw source by its safe basename."""
+
+    kb: str = Field(..., min_length=1)
+    path: str = Field(..., min_length=1)
 
 
 class StatusResponse(BaseModel):

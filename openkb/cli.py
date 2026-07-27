@@ -421,11 +421,14 @@ def _run_compile_with_retry(coro_factory, label: str) -> None:
     click.echo(f"  {label}...")
     for attempt in range(2):
         try:
+            logger.info("%s (attempt %d/2)", label, attempt + 1)
             asyncio.run(coro_factory())
+            logger.info("%s completed", label)
             return
         except Exception as exc:
             if attempt == 0:
                 click.echo("  Retrying compilation in 2s...")
+                logger.warning("%s failed on attempt 1/2: %s; retrying", label, exc)
                 time.sleep(2)
             else:
                 click.echo(f"  [ERROR] Compilation failed: {exc}")
@@ -470,11 +473,13 @@ def _add_single_file_locked(
     if bundle is None:
         _setup_llm_key(kb_dir)
     model: str = config.get("model", DEFAULT_CONFIG["model"])
+    logger.info("Preparing %s with model %s", file_path.name, model)
 
     staging_dir = _staging_dir_for(kb_dir, file_path) if stage else None
 
     # 2. Convert document into staging when possible.
     click.echo(f"Adding: {file_path.name}")
+    logger.info("Converting %s into source artifacts", file_path.name)
     try:
         result = convert_document(file_path, kb_dir, staging_dir=staging_dir)
     except Exception as exc:
@@ -489,12 +494,19 @@ def _add_single_file_locked(
         return "skipped"
 
     doc_name = result.doc_name or file_path.stem
+    logger.info(
+        "Conversion ready for %s (document=%s, kind=%s)",
+        file_path.name,
+        doc_name,
+        "long" if result.is_long_doc else "short",
+    )
     index_result = None  # populated only on the long-doc branch
 
     final_raw, final_source = _final_artifact_paths(result, kb_dir)
 
     def commit_body(snapshot) -> None:
         nonlocal index_result
+        logger.info("Publishing staged source artifacts for %s", file_path.name)
         publish_staged_tree(staging_dir, kb_dir)
         if final_raw is not None:
             result.raw_path = final_raw
@@ -505,6 +517,7 @@ def _add_single_file_locked(
             if result.raw_path is None:
                 raise RuntimeError(f"Converted long document has no raw artifact: {file_path.name}")
             click.echo("  Long document detected — indexing with PageIndex...")
+            logger.info("Indexing long document %s with PageIndex", file_path.name)
             # PageIndex content-dedups: if the same content is already indexed
             # (e.g. hashes.json and pageindex.db diverged after a remove whose
             # PageIndex cleanup failed), col.add() returns the EXISTING doc_id
@@ -541,6 +554,7 @@ def _add_single_file_locked(
                 )
 
             summary_path = kb_dir / "wiki" / "summaries" / f"{doc_name}.md"
+            logger.info("Compiling indexed document %s into wiki pages", file_path.name)
             _run_compile_with_retry(
                 lambda: compile_long_doc(
                     doc_name,
@@ -558,6 +572,7 @@ def _add_single_file_locked(
             if result.source_path is None:
                 raise RuntimeError(f"Converted document has no source artifact: {file_path.name}")
             source_path = result.source_path
+            logger.info("Compiling source document %s into wiki pages", file_path.name)
             _run_compile_with_retry(
                 lambda: compile_short_doc(
                     doc_name,
@@ -595,6 +610,7 @@ def _add_single_file_locked(
                 ):
                     registry.remove_by_hash(existing_hash)
             registry.add(result.file_hash, meta)
+            logger.info("Registered compiled document %s in the knowledge base", file_path.name)
 
     def append_ingest_log() -> None:
         append_log(kb_dir / "wiki", "ingest", file_path.name)
@@ -618,9 +634,11 @@ def _add_single_file_locked(
         },
         staging_dirs=[staging_dir],
     )
+    logger.info("Committing compiled output for %s", file_path.name)
     if not run_add_mutation(kb_dir, plan):
         return "failed"
     click.echo(f"  [OK] {file_path.name} added to knowledge base.")
+    logger.info("Completed upload and compilation for %s", file_path.name)
     return "added"
 
 
@@ -3628,18 +3646,57 @@ def get_kb_list(kb_dir: Path) -> dict[str, Any]:
     hashes = json.loads(hashes_file.read_text(encoding="utf-8")) if hashes_file.exists() else {}
 
     documents = []
+    registered_raw_names: set[str] = set()
     for file_hash, meta in hashes.items():
         raw_type = meta.get("type", "unknown")
         pages = meta.get("pages")
+        document_name = str(meta.get("name", "unknown"))
         documents.append(
             {
                 "hash": file_hash,
-                "name": meta.get("name", "unknown"),
+                "name": document_name,
                 "type": raw_type,
                 "display_type": _display_type(raw_type),
                 "pages": pages if pages not in ("", 0) else None,
             }
         )
+        # A few pre-raw_path registry entries only retain the original name.
+        # Upload reservation makes raw basenames unique, so an exact name match
+        # is still a safe signal that this raw file is the registered source.
+        registered_raw_names.add(Path(document_name).name)
+        # Modern entries record the canonical raw artifact explicitly. Older
+        # entries used ``path`` for the same purpose, so accept both when
+        # deciding which raw files are already compiled.
+        raw_ref = meta.get("raw_path") or meta.get("path")
+        if raw_ref:
+            raw_path = Path(str(raw_ref))
+            if raw_path.parent.name == "raw" or str(raw_ref).startswith("raw/"):
+                registered_raw_names.add(raw_path.name)
+
+    raw_dir = kb_dir / "raw"
+    pending_documents = []
+    if raw_dir.exists():
+        for raw_path in sorted(raw_dir.iterdir(), key=lambda path: path.name.lower()):
+            if (
+                not raw_path.is_file()
+                or raw_path.name in registered_raw_names
+                or raw_path.suffix.lower() not in SUPPORTED_EXTENSIONS
+            ):
+                continue
+            try:
+                size_bytes = raw_path.stat().st_size
+            except OSError:
+                continue
+            raw_type = raw_path.suffix.lower().lstrip(".") or "unknown"
+            pending_documents.append(
+                {
+                    "path": raw_path.name,
+                    "name": raw_path.name,
+                    "type": raw_type,
+                    "display_type": _display_type(raw_type),
+                    "size_bytes": size_bytes,
+                }
+            )
 
     summaries_dir = kb_dir / "wiki" / "summaries"
     concepts_dir = kb_dir / "wiki" / "concepts"
@@ -3647,6 +3704,7 @@ def get_kb_list(kb_dir: Path) -> dict[str, Any]:
     reports_dir = kb_dir / "wiki" / "reports"
     return {
         "documents": documents,
+        "pending_documents": pending_documents,
         "document_count": len(documents),
         "summaries": sorted(p.stem for p in summaries_dir.glob("*.md"))
         if summaries_dir.exists()
