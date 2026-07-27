@@ -3,11 +3,11 @@ import { useNavigate, useParams } from 'react-router'
 import { useTranslation } from 'react-i18next'
 import * as Dialog from '@radix-ui/react-dialog'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
-import { FileText, Link2, Loader2, Pencil, Upload, RefreshCw, Settings2, Trash2, Circle, CheckCircle2, CircleSlash2, XCircle, X, Ban, BookOpen, ChevronLeft, ChevronRight, ChevronDown, ChevronsLeft, ChevronsRight, Eye, ListTree } from 'lucide-react'
+import { FileText, Link2, Loader2, Pencil, Upload, RefreshCw, Settings2, Trash2, X, BookOpen, ChevronLeft, ChevronRight, ChevronDown, ChevronsLeft, ChevronsRight, Eye, ListTree } from 'lucide-react'
 import { toast } from 'sonner'
 import { deletePage, editPage, getDocumentSource, getKbInventory, getPage, getPageLinks, type DocumentSource, type KbInventory, type WikiDocument } from '@/api/wiki'
 import { getDocirByHash, type DocirNode } from '@/api/legal'
-import { startUpload, streamJobEvents, listJobs, cancelJob, removeDocument, type AddResult, type UploadEvent } from '@/api/maintenance'
+import { removeDocument, type JobSummary } from '@/api/maintenance'
 import { ApiError } from '@/api/client'
 import MarkdownView from '@/components/MarkdownView'
 import PageList from '@/components/PageList'
@@ -17,6 +17,8 @@ import KbSettingsSheet from '@/components/KbSettingsSheet'
 import LegalGraphView from '@/components/legal/LegalGraphView'
 import LifecycleView from '@/components/legal/LifecycleView'
 import SyncSourcesView from '@/components/legal/SyncSourcesView'
+import JobsPanel from '@/components/JobsPanel'
+import { useJobs, type UploadFileState } from '@/hooks/useJobs'
 import { useAnimatedSwitch } from '@/hooks/useAnimatedSwitch'
 import { cn } from '@/lib/utils'
 
@@ -59,21 +61,6 @@ function stripFrontmatter(md: string): string {
   if (!m) return md
   if (!m[1].split(/\r?\n/).every(looksLikeYamlLine)) return md
   return md.slice(m[0].length)
-}
-
-/** Per-file lifecycle during a streaming upload. `pending` → `processing`
- *  (backend `file_start`) → terminal `added`/`skipped`/`failed` (`file_done`,
- *  the `AddFileItem.status`), or `cancelled` when the user aborts the batch
- *  mid-upload (the server rolls the in-flight file back). */
-type UploadStatus = 'pending' | 'processing' | 'added' | 'skipped' | 'failed' | 'cancelled'
-interface UploadFileState {
-  /** Stable generated id, assigned once at seed time — the React key. Rows are
-   *  correlated to backend events by their array index, not this id or the
-   *  basename (two same-basename files from different folders must not collide). */
-  id: string
-  name: string
-  status: UploadStatus
-  message?: string
 }
 
 /** One selected wiki page, derived from its `<type>/<name>` path. */
@@ -130,27 +117,11 @@ export default function KbDetail() {
   const [page, setPage] = useState<{ path: string; content: string } | null>(null)
   const [pageError, setPageError] = useState<{ path: string; message: string } | null>(null)
 
-  // Documents section: upload state. `uploadFiles` tracks per-file progress
-  // for the current/most-recent streaming upload; it is reset at the start of
-  // each upload and kept afterwards so final per-file statuses stay visible.
+  // Documents section: upload + compile-jobs state. The jobs engine (polling,
+  // selectable per-job logs, client-side hash dedup) lives in `useJobs` below;
+  // only the dropzone's drag state and file input stay here.
   const fileInputRef = useRef<HTMLInputElement>(null)
-  const [uploading, setUploading] = useState(false)
-  const [uploadFiles, setUploadFiles] = useState<UploadFileState[]>([])
-  // Live compile log lines streamed from the backend (`log` SSE frames) for
-  // the current/most-recent upload; reset at the start of each upload.
-  const [uploadLogs, setUploadLogs] = useState<string[]>([])
   const [dragActive, setDragActive] = useState(false)
-  // Monotonic counter for per-row ids (React keys), and the AbortController for
-  // the in-flight job SSE VIEW — aborted on unmount to detach the view only;
-  // the server-owned job itself keeps running (cancel is an explicit endpoint).
-  const rowIdSeq = useRef(0)
-  const uploadAbortRef = useRef<AbortController | null>(null)
-  // The job currently watched (server-owned add job), and the job THIS session
-  // started — the only one whose completion/cancel fires toasts, so restored
-  // history from a refresh replays silently.
-  const activeJobIdRef = useRef<string | null>(null)
-  const notifyJobIdRef = useRef<string | null>(null)
-  useEffect(() => () => uploadAbortRef.current?.abort(), [])
 
   const selected = useMemo(() => parseSelected(selectedPath), [selectedPath])
   const openPath = useCallback((path: string) => setSelectedPath(path), [])
@@ -250,167 +221,16 @@ export default function KbDetail() {
     [refreshInventory],
   )
 
-  /** Fold one add-job SSE event into the per-file rows and log panel. Shared
-   *  by live uploads and post-refresh re-attach (which replays history, so the
-   *  same fold rebuilds the exact same view from the server's event ring). */
-  const applyJobEvent = useCallback(
-    (jobId: string, ev: UploadEvent) => {
-      const notify = notifyJobIdRef.current === jobId
-      if (ev.type === 'file_start') {
-        setUploadFiles((prev) =>
-          prev.length > ev.index
-            ? prev.map((f, i) => (i === ev.index ? { ...f, status: 'processing' } : f))
-            : [...prev, { id: String(rowIdSeq.current++), name: ev.original_name, status: 'processing' as const }],
-        )
-      } else if (ev.type === 'file_done') {
-        setUploadFiles((prev) =>
-          prev.map((f, i) =>
-            i === ev.index
-              ? { ...f, status: ev.file.status as UploadStatus, message: ev.file.message }
-              : f,
-          ),
-        )
-      } else if (ev.type === 'log') {
-        // Keep the panel bounded on very long compiles.
-        setUploadLogs((prev) =>
-          prev.length >= 500 ? [...prev.slice(prev.length - 499), ev.message] : [...prev, ev.message],
-        )
-      } else if (ev.type === 'cancelled') {
-        setUploadFiles((prev) =>
-          prev.map((f) =>
-            f.status === 'pending' || f.status === 'processing'
-              ? { ...f, status: 'cancelled' as const }
-              : f,
-          ),
-        )
-        if (notify) toast.info(t('kb:upload.cancelledToast'))
-      } else if (ev.type === 'error') {
-        if (notify) toast.error(ev.message)
-      } else if (ev.type === 'final' && notify) {
-        // `/api/v1/add` reports per-file failures inside the summary, so branch
-        // on the real added/failed/skipped counts, not on stream completion.
-        const res: AddResult = ev.result
-        const parts = [t('kb:upload.added', { count: res.added_count })]
-        if (res.skipped_count) parts.push(t('kb:upload.skipped', { count: res.skipped_count }))
-        if (res.failed_count) parts.push(t('kb:upload.failed', { count: res.failed_count }))
-        const line = parts.join(' · ')
-        if (res.added_count === 0 && res.failed_count > 0) {
-          // Every file failed — surface the first failure's message so the
-          // user learns WHY (e.g. compile error / missing LLM API key).
-          const reason = res.files.find((f) => f.status === 'failed')?.message
-          toast.error(t('kb:upload.errorToast', { summary: line }) + (reason ? t('kb:upload.reasonSuffix', { reason }) : ''))
-        } else if (res.failed_count > 0) {
-          toast.warning(t('kb:upload.partialToast', { summary: line }))
-        } else if (res.added_count > 0) {
-          toast.success(t('kb:upload.successToast', { summary: line }))
-        } else {
-          // All skipped duplicates — neutral, not an error, not "added".
-          toast.info(t('kb:upload.existsToast', { summary: line }))
-        }
-      }
-    },
-    [t],
-  )
+  // Compile-jobs engine: polls `listJobs`, tails the selected job's SSE stream
+  // (re-attachable - a refresh or a click on an old job replays its rows + log
+  // from the server's event ring), and dedups uploads by SHA-256 against the
+  // KB's known document hashes so already-uploaded files aren't re-sent.
+  const jobs = useJobs(id, {
+    getKnownHashes: () =>
+      new Set((inv?.documents ?? []).map((d) => d.hash).filter(Boolean)),
+    onCompleted: refreshInventory,
+  })
 
-  /** Attach the UI to one server-owned job: replays its event history (so a
-   *  page refresh restores rows + logs) then tails live frames until the job's
-   *  terminal `done`. Aborting `uploadAbortRef` detaches THIS VIEW only — the
-   *  job keeps running server-side until it finishes or is cancelled via the
-   *  cancel endpoint (that's what survives the refresh). */
-  const attachJob = useCallback(
-    async (jobId: string) => {
-      activeJobIdRef.current = jobId
-      setUploading(true)
-      const controller = new AbortController()
-      uploadAbortRef.current = controller
-      let sawFinal = false
-      try {
-        await streamJobEvents(
-          jobId,
-          (ev) => {
-            if (ev.type === 'final') sawFinal = true
-            applyJobEvent(jobId, ev)
-          },
-          controller.signal,
-        )
-        if (controller.signal.aborted) return // view detached — no side effects
-        // A job can fail before producing a summary; settle any rows the
-        // failure left spinning.
-        if (!sawFinal) {
-          setUploadFiles((prev) =>
-            prev.map((f) =>
-              f.status === 'pending' || f.status === 'processing'
-                ? { ...f, status: 'failed' as const }
-                : f,
-            ),
-          )
-        }
-        await refreshInventory()
-      } catch (e) {
-        // Abort = the view detached (unmount/navigation); the job is unaffected
-        // and a later mount re-attaches. Real stream failures surface.
-        if (!controller.signal.aborted) toast.error(errMsg(e))
-      } finally {
-        if (activeJobIdRef.current === jobId) activeJobIdRef.current = null
-        if (!controller.signal.aborted) setUploading(false)
-      }
-    },
-    [applyJobEvent, refreshInventory],
-  )
-
-  const doUpload = useCallback(
-    async (files: File[]) => {
-      if (files.length === 0 || uploading) return
-      // Seed one row per file so the full set shows immediately, then flip each
-      // to processing/terminal as job events arrive. Rows correlate to events
-      // by array index (event order == files order), NOT by basename, so two
-      // same-basename files from different folders never collide.
-      setUploadFiles(files.map((f) => ({ id: String(rowIdSeq.current++), name: f.name, status: 'pending' as const })))
-      setUploadLogs([])
-      try {
-        // Starts a server-owned job and returns immediately with its id — the
-        // compile no longer blocks on (or dies with) this HTTP request.
-        const accepted = await startUpload(id, files)
-        notifyJobIdRef.current = accepted.job_id
-        await attachJob(accepted.job_id)
-      } catch (e) {
-        setUploadFiles((prev) => prev.map((f) => ({ ...f, status: 'failed' as const })))
-        toast.error(errMsg(e))
-      }
-    },
-    [id, uploading, attachJob],
-  )
-
-  /** Cancel the watched job via the backend (cooperative: the worker stops at
-   *  its next checkpoint and the in-flight mutation rolls back; the `cancelled`
-   *  job event settles the rows and toasts). Closing the tab does NOT cancel —
-   *  the job is server-owned precisely so it survives navigation/refresh. */
-  const cancelUpload = useCallback(() => {
-    const jobId = activeJobIdRef.current
-    if (!jobId) return
-    cancelJob(jobId).catch((e) => toast.error(errMsg(e)))
-  }, [])
-
-  // After a refresh/remount: rediscover this KB's most recent add job and
-  // re-attach — the server kept it running, and its event ring replays the
-  // rows + logs. Past jobs replay silently (toasts only for jobs THIS session
-  // started, via notifyJobIdRef).
-  useEffect(() => {
-    let stale = false
-    listJobs(id)
-      .then((jobs) => {
-        const latest = [...jobs].reverse().find((j) => j.kind === 'add')
-        if (!latest || stale) return
-        setUploadFiles([])
-        setUploadLogs([])
-        notifyJobIdRef.current = null
-        void attachJob(latest.id)
-      })
-      .catch(() => {}) // no jobs yet / server unreachable — nothing to restore
-    return () => {
-      stale = true
-    }
-  }, [id, attachJob])
 
   /** Remove one document via `/api/v1/remove`, then refresh + toast. The
    *  identifier is the document's original filename (`WikiDocument.name`),
@@ -527,16 +347,20 @@ export default function KbDetail() {
             kb={id}
             documents={documents}
             invError={invError}
-            uploading={uploading}
-            uploadFiles={uploadFiles}
-            uploadLogs={uploadLogs}
+            uploading={jobs.uploading}
             dragActive={dragActive}
             fileInputRef={fileInputRef}
             onDragActiveChange={setDragActive}
-            onUpload={doUpload}
-            onCancelUpload={cancelUpload}
+            onUpload={jobs.doUpload}
+            onCancelUpload={jobs.cancelUpload}
             onRefresh={refreshInventory}
             onDelete={onDeleteDocument}
+            jobs={jobs.jobs}
+            selectedJobId={jobs.selectedJobId}
+            selectedFiles={jobs.selectedFiles}
+            selectedLogs={jobs.selectedLogs}
+            selectedRunning={jobs.selectedRunning}
+            onSelectJob={jobs.selectJob}
           />
         ) : section === 'legal-graph' ? (
           <LegalGraphView kb={id} />
@@ -917,24 +741,6 @@ function IndexReader(props: ReaderProps) {
   )
 }
 
-/** Status glyph for one per-file upload row. */
-function UploadStatusIcon({ status }: { status: UploadStatus }) {
-  switch (status) {
-    case 'processing':
-      return <Loader2 className="w-3.5 h-3.5 animate-spin text-muted-foreground" />
-    case 'added':
-      return <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500 dark:text-emerald-400" />
-    case 'skipped':
-      return <CircleSlash2 className="w-3.5 h-3.5 text-muted-foreground" />
-    case 'failed':
-      return <XCircle className="w-3.5 h-3.5 text-red-500 dark:text-red-400" />
-    case 'cancelled':
-      return <Ban className="w-3.5 h-3.5 text-amber-500 dark:text-amber-400" />
-    default:
-      return <Circle className="w-3.5 h-3.5 text-muted-foreground/50" />
-  }
-}
-
 /** Read-only slide-out reader for a document's converted source text.
  *
  * Presentational: the parent (DocumentsPane) owns the fetch, per-hash cache,
@@ -1303,8 +1109,6 @@ function DocumentsPane({
   documents,
   invError,
   uploading,
-  uploadFiles,
-  uploadLogs,
   dragActive,
   fileInputRef,
   onDragActiveChange,
@@ -1312,13 +1116,17 @@ function DocumentsPane({
   onCancelUpload,
   onRefresh,
   onDelete,
+  jobs,
+  selectedJobId,
+  selectedFiles,
+  selectedLogs,
+  selectedRunning,
+  onSelectJob,
 }: {
   kb: string
   documents: WikiDocument[]
   invError: string | null
   uploading: boolean
-  uploadFiles: UploadFileState[]
-  uploadLogs: string[]
   dragActive: boolean
   fileInputRef: RefObject<HTMLInputElement | null>
   onDragActiveChange: (active: boolean) => void
@@ -1326,6 +1134,12 @@ function DocumentsPane({
   onCancelUpload: () => void
   onRefresh: () => void
   onDelete: (identifier: string) => Promise<void>
+  jobs: JobSummary[]
+  selectedJobId: string | null
+  selectedFiles: UploadFileState[]
+  selectedLogs: string[]
+  selectedRunning: boolean
+  onSelectJob: (id: string) => void
 }) {
   const { t } = useTranslation(['kb', 'common'])
   // Inline delete confirm: `confirmName` is the row awaiting confirmation;
@@ -1425,13 +1239,6 @@ function DocumentsPane({
     }
   }
 
-  // Compile-log panel: pin to the bottom as new lines stream in, so the user
-  // watches live progress without manual scrolling.
-  const logRef = useRef<HTMLDivElement>(null)
-  useEffect(() => {
-    const el = logRef.current
-    if (el) el.scrollTop = el.scrollHeight
-  }, [uploadLogs])
   return (
     <>
     <div className="h-full overflow-y-auto scroll-edge-top">
@@ -1484,56 +1291,17 @@ function DocumentsPane({
           )}
         </div>
 
-        {/* Per-file upload progress (streaming /api/v1/add?stream=true) */}
-        {uploadFiles.length > 0 && (
-          <div className="mt-4">
-            <div className="flex items-center justify-between gap-2">
-              <h2 className="text-[13.5px] font-semibold text-foreground">
-                {t('kb:upload.progressHeading', { count: uploadFiles.length })}
-              </h2>
-              {uploading && (
-                <button
-                  type="button"
-                  onClick={onCancelUpload}
-                  className="inline-flex items-center gap-1.5 rounded-lg border border-[hsl(var(--glass-border))] glass-2 px-2.5 py-1 text-[12px] font-medium text-muted-foreground transition-colors hover:text-red-500 hover:border-red-500/40"
-                >
-                  <Ban className="w-3.5 h-3.5" />
-                  {t('kb:upload.cancel')}
-                </button>
-              )}
-            </div>
-            <div className="mt-2 space-y-1.5">
-              {uploadFiles.map((f) => (
-                <div
-                  key={f.id}
-                  className="rounded-xl border border-[hsl(var(--glass-border))] glass-2 px-3 py-2 flex items-center gap-2.5"
-                >
-                  <UploadStatusIcon status={f.status} />
-                  <span className="text-[13px] text-foreground truncate">{f.name}</span>
-                  <span className="ml-auto text-[11.5px] text-muted-foreground shrink-0">
-                    {t(`kb:upload.fileStatus.${f.status}`)}
-                  </span>
-                </div>
-              ))}
-            </div>
-            {/* Live compile log streamed from the backend (`log` SSE frames). */}
-            {uploadLogs.length > 0 && (
-              <div className="mt-3">
-                <h3 className="text-[12px] font-medium text-muted-foreground">
-                  {t('kb:upload.logHeading')}
-                </h3>
-                <div
-                  ref={logRef}
-                  className="mt-1.5 max-h-56 overflow-y-auto rounded-xl border border-[hsl(var(--glass-border))] bg-muted/40 px-3 py-2 font-mono text-[11px] leading-relaxed text-muted-foreground"
-                >
-                  {uploadLogs.map((line, i) => (
-                    <div key={i} className="whitespace-pre-wrap break-all">{line}</div>
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
-        )}
+        {/* Compile jobs: selectable list + the selected job's files and log
+            (client-side hash dedup, live SSE tail, re-attachable on refresh). */}
+        <JobsPanel
+          jobs={jobs}
+          selectedJobId={selectedJobId}
+          selectedFiles={selectedFiles}
+          selectedLogs={selectedLogs}
+          selectedRunning={selectedRunning}
+          onSelectJob={onSelectJob}
+          onCancelUpload={onCancelUpload}
+        />
 
         {/* Uploaded documents (real /api/v1/list) */}
         <div className="mt-6 flex items-center justify-between">

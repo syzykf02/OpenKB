@@ -29,6 +29,21 @@
       "processing": "Compiling…",
       "added": "Added",
       "skipped": "Skipped",
+      "exists": "Already in KB",
+      "failed": "Failed",
+      "cancelled": "Cancelled"
+    }
+  },
+  "jobs": {
+    "heading": "Compile jobs · {{count}}",
+    "empty": "No compile jobs yet",
+    "selectHint": "Select a job to view its files and log",
+    "filesLabel": "{{count}} file(s)",
+    "allExist": "All {{count}} file(s) are already in the KB - nothing uploaded",
+    "status": {
+      "queued": "Queued",
+      "running": "Running",
+      "done": "Done",
       "failed": "Failed",
       "cancelled": "Cancelled"
     }

@@ -29,6 +29,21 @@
       "processing": "编译中…",
       "added": "已新增",
       "skipped": "已跳过",
+      "exists": "已存在",
+      "failed": "失败",
+      "cancelled": "已取消"
+    }
+  },
+  "jobs": {
+    "heading": "编译任务 · {{count}}",
+    "empty": "暂无编译任务",
+    "selectHint": "选择任务以查看文件与日志",
+    "filesLabel": "{{count}} 个文件",
+    "allExist": "{{count}} 个文件均已存在，未上传",
+    "status": {
+      "queued": "排队中",
+      "running": "进行中",
+      "done": "完成",
       "failed": "失败",
       "cancelled": "已取消"
     }
