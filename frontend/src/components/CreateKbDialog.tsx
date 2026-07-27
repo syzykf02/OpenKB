@@ -96,9 +96,24 @@ export default function CreateKbDialog({ children }: { children: ReactNode }) {
                 animate={{ opacity: 1 }}
                 exit={{ opacity: 0 }}
                 transition={reduce ? { duration: 0.12 } : { duration: 0.2 }}
+                onClick={(e) => {
+                  // `Dialog.Content` is composed around a motion element. In
+                  // that combination Radix can occasionally classify an
+                  // interaction on the animated panel as outside. Keep
+                  // backdrop dismissal explicit, and only when its own
+                  // surface was clicked.
+                  if (e.target === e.currentTarget) onOpenChange(false)
+                }}
               />
             </Dialog.Overlay>
-            <Dialog.Content asChild>
+            <Dialog.Content
+              asChild
+              // Outside dismissal is handled by the backdrop above. This
+              // prevents a pointer event on the motion-composed form from
+              // being mistaken for a click outside the dialog.
+              onPointerDownOutside={(e) => e.preventDefault()}
+              onInteractOutside={(e) => e.preventDefault()}
+            >
               <motion.div
                 className="fixed inset-0 z-50 grid place-items-center p-4"
                 initial={reduce ? { opacity: 0 } : { opacity: 0, scale: 0.96, y: 8 }}

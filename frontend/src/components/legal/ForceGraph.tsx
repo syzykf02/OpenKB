@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import * as d3 from 'd3'
 import type { GraphNode, LegalGraphEdge } from '@/api/legal'
+import { graphNodeStyle } from './graphNodeStyle'
 
 /** d3 simulation node: graph node + force-layout position fields. */
 type SimNode = GraphNode & d3.SimulationNodeDatum
@@ -12,20 +13,6 @@ type NodeSel = d3.Selection<SVGGElement, SimNode, SVGGElement, unknown>
 type LinkSel = d3.Selection<SVGLineElement, SimLink, SVGGElement, unknown>
 type LinkLabelSel = d3.Selection<SVGTextElement, SimLink, SVGGElement, unknown>
 
-// Per node_type palette (mirrors the old mermaid classDef colors). Fills are
-// light enough to read on both light and dark backgrounds; labels use
-// `currentColor` so they follow the page text color per theme.
-const TYPE_STYLE: Record<string, { fill: string; stroke: string }> = {
-  statute: { fill: '#dbeafe', stroke: '#2563eb' },
-  regulation: { fill: '#e0e7ff', stroke: '#4f46e5' },
-  case: { fill: '#dcfce7', stroke: '#16a34a' },
-  concept: { fill: '#f3e8ff', stroke: '#9333ea' },
-  court: { fill: '#ffedd5', stroke: '#ea580c' },
-  doctrine: { fill: '#cffafe', stroke: '#0891b2' },
-  document: { fill: '#f1f5f9', stroke: '#64748b' },
-}
-const DEFAULT_STYLE = { fill: '#f1f5f9', stroke: '#64748b' }
-const styleFor = (t: string) => TYPE_STYLE[t] ?? DEFAULT_STYLE
 const trunc = (s: string, n: number) => (s.length > n ? s.slice(0, n - 1) + '…' : s)
 
 const W = 900
@@ -179,8 +166,8 @@ export function ForceGraph({
     nodeSel
       .append('circle')
       .attr('r', (d: SimNode) => radius(d.node_id))
-      .attr('fill', (d: SimNode) => styleFor(d.node_type).fill)
-      .attr('stroke', (d: SimNode) => styleFor(d.node_type).stroke)
+      .attr('fill', (d: SimNode) => graphNodeStyle(d.node_type).fill)
+      .attr('stroke', (d: SimNode) => graphNodeStyle(d.node_type).stroke)
       .attr('stroke-width', 1.5)
 
     nodeSel

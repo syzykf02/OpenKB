@@ -10,6 +10,7 @@ import {
 } from '@/api/legal'
 import { ApiError } from '@/api/client'
 import { ForceGraph } from './ForceGraph'
+import { graphNodeStyle } from './graphNodeStyle'
 
 /** Legal knowledge graph: mermaid visualization + filters + node detail/impact (UI §3.1). */
 export default function LegalGraphView({ kb }: { kb: string }) {
@@ -135,7 +136,7 @@ export default function LegalGraphView({ kb }: { kb: string }) {
       </div>
 
       <div className="grid gap-3 md:grid-cols-2">
-        <div className="rounded-apple-md glass-2 border border-[hsl(var(--glass-border))] p-3">
+        <div className="min-h-0 rounded-apple-md glass-2 border border-[hsl(var(--glass-border))] p-3">
           <h4 className="mb-1 text-xs font-semibold uppercase text-muted-foreground">{t('graph.nodes')}</h4>
           {!data ? null : data.nodes.length === 0 ? (
             <p className="text-xs text-muted-foreground">{t('graph.empty')}</p>
@@ -148,7 +149,7 @@ export default function LegalGraphView({ kb }: { kb: string }) {
                     className={`w-full rounded-md px-2 py-1.5 text-left text-xs transition hover:bg-[hsl(var(--glass-hover))] ${selected?.node_id === n.node_id ? 'bg-[hsl(var(--glass-hover))]' : ''}`}
                   >
                     <span className="font-medium">{n.label}</span>
-                    <span className="ml-2 rounded bg-[hsl(var(--glass-border))] px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                    <span className={`ml-2 rounded px-1.5 py-0.5 text-[10px] font-medium ${graphNodeStyle(n.node_type).badgeClass}`}>
                       {n.node_type}
                     </span>
                   </button>
@@ -157,13 +158,15 @@ export default function LegalGraphView({ kb }: { kb: string }) {
             </ul>
           )}
         </div>
-        <div className="rounded-apple-md glass-2 border border-[hsl(var(--glass-border))] p-3">
+        <div className="min-h-0 rounded-apple-md glass-2 border border-[hsl(var(--glass-border))] p-3">
           {selected ? (
             <>
               <h3 className="text-sm font-semibold">{selected.label}</h3>
-              <p className="mt-1 text-xs text-muted-foreground">
-                {selected.node_type}
-                {selected.description ? ` · ${selected.description}` : ''}
+              <p className="mt-1 flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
+                <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${graphNodeStyle(selected.node_type).badgeClass}`}>
+                  {selected.node_type}
+                </span>
+                {selected.description && <span>· {selected.description}</span>}
                 {selected.authority_level ? ` · ${selected.authority_level}` : ''}
               </p>
               <h4 className="mt-3 text-xs font-semibold uppercase text-muted-foreground">
@@ -174,15 +177,18 @@ export default function LegalGraphView({ kb }: { kb: string }) {
               ) : impact.length === 0 ? (
                 <p className="text-xs text-muted-foreground">{t('graph.noImpact')}</p>
               ) : (
-                <ul className="mt-1 space-y-1">
+                <ul className="mt-1 max-h-[32vh] space-y-1 overflow-y-auto overscroll-contain pr-1">
                   {impact.map((r) => (
                     <li
                       key={r.node.node_id}
                       className="rounded-md bg-[hsl(var(--glass-hover))] px-2 py-1 text-xs"
                     >
                       <span className="font-medium">{r.node.label}</span>
-                      <span className="ml-2 text-[10px] text-muted-foreground">
-                        {r.node.node_type} · depth {r.depth}
+                      <span className={`ml-2 rounded px-1.5 py-0.5 text-[10px] font-medium ${graphNodeStyle(r.node.node_type).badgeClass}`}>
+                        {r.node.node_type}
+                      </span>
+                      <span className="ml-1 text-[10px] text-muted-foreground">
+                        · depth {r.depth}
                         {r.via.length ? ` · ${r.via.join('→')}` : ''}
                       </span>
                     </li>

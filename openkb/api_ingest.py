@@ -84,7 +84,11 @@ class JobLogHandler(logging.Handler):
             return
         self.job.emit_threadsafe(
             "log",
-            {"level": record.levelname.lower(), "message": message, "logger": record.name},
+            {
+                "level": record.levelname.lower(),
+                "message": message,
+                "logger": record.name,
+            },
             self.loop,
         )
 
@@ -105,7 +109,15 @@ def start_add_job(
     first = saved_uploads[0][1] if saved_uploads else "?"
     title = f"add: {first}" + (f" (+{len(saved_uploads) - 1})" if len(saved_uploads) > 1 else "")
     job = registry.create("add", kb, title)
-    job.record("start", {"endpoint": "add", "kb": kb, "file_count": len(saved_uploads)})
+    job.record(
+        "start",
+        {
+            "endpoint": "add",
+            "kb": kb,
+            "file_count": len(saved_uploads),
+            "steps_per_file": 3,
+        },
+    )
     registry.submit(
         job,
         lambda j: run_add_worker(j, kb, kb_dir, saved_uploads, bundle=bundle),
@@ -134,12 +146,38 @@ async def run_add_worker(
     token = cancel_event_var.set(job.cancel_event)
     results: list[AddFileItem] = []
     try:
-        for saved_path, original_name in saved_uploads:
+        for file_index, (saved_path, original_name) in enumerate(saved_uploads):
             if job.cancelled:
                 raise IngestCancelled("ingest cancelled by user")
-            job.record("uploaded", {"original_name": original_name, "saved_path": str(saved_path)})
+            context = {"file_index": file_index, "original_name": original_name}
+            job.record("uploaded", {**context, "saved_path": str(saved_path)})
             job.record(
-                "file_start", {"original_name": original_name, "saved_path": str(saved_path)}
+                "file_start",
+                {
+                    **context,
+                    "saved_path": str(saved_path),
+                    "completed_steps": 0,
+                    "total_steps": 3,
+                    "step": "prepare",
+                },
+            )
+            job.record(
+                "file_progress",
+                {
+                    **context,
+                    "completed_steps": 1,
+                    "total_steps": 3,
+                    "step": "prepare",
+                    "message": "Source file is ready for compilation.",
+                },
+            )
+            job.record(
+                "log",
+                {
+                    "level": "info",
+                    "logger": __name__,
+                    "message": f"{original_name}: starting conversion, indexing, and compilation.",
+                },
             )
             try:
                 item = await _add_file_for_job(
@@ -151,15 +189,47 @@ async def run_add_worker(
                 job.record(
                     "file_done",
                     {
+                        **context,
                         "original_name": original_name,
                         "saved_path": None,
                         "status": "cancelled",
                         "message": "Cancelled by user",
+                        "completed_steps": 1,
+                        "total_steps": 3,
+                        "step": "compile",
                     },
                 )
                 raise
             results.append(item)
-            job.record("file_done", _model_payload(item))
+            payload = _model_payload(item)
+            job.record(
+                "file_progress",
+                {
+                    **context,
+                    "completed_steps": 3 if item.status in {"added", "skipped"} else 2,
+                    "total_steps": 3,
+                    "step": "finalize" if item.status in {"added", "skipped"} else "compile",
+                    "message": item.message,
+                },
+            )
+            job.record(
+                "log",
+                {
+                    "level": "info" if item.status in {"added", "skipped"} else "error",
+                    "logger": __name__,
+                    "message": f"{original_name}: {item.message}",
+                },
+            )
+            job.record(
+                "file_done",
+                {
+                    **payload,
+                    **context,
+                    "completed_steps": 3 if item.status in {"added", "skipped"} else 2,
+                    "total_steps": 3,
+                    "step": "finalize" if item.status in {"added", "skipped"} else "compile",
+                },
+            )
         return _model_payload(_summarize_add_results(kb, results))
     finally:
         cancel_event_var.reset(token)

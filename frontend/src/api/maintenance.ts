@@ -47,11 +47,38 @@ export interface WatchStatus {
  * away here; `done` terminates the stream.
  */
 export type UploadEvent =
-  | { type: "file_start"; index: number; original_name: string }
-  | { type: "file_done"; index: number; file: AddFileItem }
+  | {
+      type: "file_start"
+      index: number
+      original_name: string
+      completed_steps?: number
+      total_steps?: number
+      step?: string
+    }
+  | {
+      type: "file_progress"
+      index: number
+      completed_steps: number
+      total_steps: number
+      step: string
+      message: string
+    }
+  | {
+      type: "file_done"
+      index: number
+      file: AddFileItem
+      completed_steps?: number
+      total_steps?: number
+      step?: string
+    }
   /** Live compile log line captured from the worker thread (`openkb.*`
    *  loggers) — the UI shows these in the upload log panel. */
-  | { type: "log"; message: string; level: string; logger: string }
+  | {
+      type: "log"
+      message: string
+      level: string
+      logger: string
+    }
   | { type: "final"; result: AddResult }
   /** The job was cancelled (explicit cancel endpoint); the in-flight mutation
    *  was rolled back server-side. Emitted instead of `final`. */
@@ -123,6 +150,17 @@ export function cancelJob(jobId: string): Promise<{ status: string }> {
   return apiFetch<{ status: string }>(`/api/v1/jobs/${jobId}/cancel`, { body: {} })
 }
 
+/** Re-run one failed file from the retained raw source of an add job. */
+export function retryJobFile(
+  jobId: string,
+  kb: string,
+  fileIndex: number,
+): Promise<{ job_id: string; kb: string; status: string }> {
+  return apiFetch<{ job_id: string; kb: string; status: string }>(`/api/v1/jobs/${jobId}/retry`, {
+    body: { kb, file_index: fileIndex },
+  })
+}
+
 /**
  * Tail one job's SSE event stream, calling `onEvent` per frame. Re-attachable:
  * frames carry monotonic SSE `id:` cursors; pass `lastSeq` to resume after the
@@ -179,11 +217,35 @@ export async function streamJobEvents(
       }
       switch (event) {
         case "file_start":
-          fileCursor += 1
-          onEvent({ type: "file_start", index: fileCursor, original_name: data.original_name })
+          fileCursor = Number.isInteger(data.file_index) ? data.file_index : fileCursor + 1
+          onEvent({
+            type: "file_start",
+            index: fileCursor,
+            original_name: String(data.original_name ?? ""),
+            completed_steps: Number(data.completed_steps ?? 0),
+            total_steps: Number(data.total_steps ?? 0),
+            step: typeof data.step === "string" ? data.step : undefined,
+          })
+          break
+        case "file_progress":
+          onEvent({
+            type: "file_progress",
+            index: Number.isInteger(data.file_index) ? data.file_index : fileCursor,
+            completed_steps: Number(data.completed_steps ?? 0),
+            total_steps: Number(data.total_steps ?? 0),
+            step: String(data.step ?? "compile"),
+            message: String(data.message ?? ""),
+          })
           break
         case "file_done":
-          onEvent({ type: "file_done", index: fileCursor, file: data as AddFileItem })
+          onEvent({
+            type: "file_done",
+            index: Number.isInteger(data.file_index) ? data.file_index : fileCursor,
+            file: data as AddFileItem,
+            completed_steps: Number(data.completed_steps ?? 0),
+            total_steps: Number(data.total_steps ?? 0),
+            step: typeof data.step === "string" ? data.step : undefined,
+          })
           break
         case "log":
           onEvent({

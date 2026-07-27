@@ -3,11 +3,11 @@ import { useNavigate, useParams } from 'react-router'
 import { useTranslation } from 'react-i18next'
 import * as Dialog from '@radix-ui/react-dialog'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
-import { FileText, Link2, Loader2, Pencil, Upload, RefreshCw, Settings2, Trash2, X, BookOpen, ChevronLeft, ChevronRight, ChevronDown, ChevronsLeft, ChevronsRight, Eye, ListTree } from 'lucide-react'
+import { Cloud, FileText, FolderOpen, Link2, ListChecks, Loader2, Pencil, Plus, Upload, RefreshCw, Settings2, Trash2, X, BookOpen, ChevronLeft, ChevronRight, ChevronDown, ChevronsLeft, ChevronsRight, Eye, ListTree, type LucideIcon } from 'lucide-react'
 import { toast } from 'sonner'
 import { deletePage, editPage, getDocumentSource, getKbInventory, getPage, getPageLinks, type DocumentSource, type KbInventory, type WikiDocument } from '@/api/wiki'
 import { getDocirByHash, type DocirNode } from '@/api/legal'
-import { removeDocument, type JobSummary } from '@/api/maintenance'
+import { removeDocument } from '@/api/maintenance'
 import { ApiError } from '@/api/client'
 import MarkdownView from '@/components/MarkdownView'
 import PageList from '@/components/PageList'
@@ -18,7 +18,8 @@ import LegalGraphView from '@/components/legal/LegalGraphView'
 import LifecycleView from '@/components/legal/LifecycleView'
 import SyncSourcesView from '@/components/legal/SyncSourcesView'
 import JobsPanel from '@/components/JobsPanel'
-import { useJobs, type UploadFileState } from '@/hooks/useJobs'
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { useJobs, type CompileTaskFile, type UploadLogLine } from '@/hooks/useJobs'
 import { useAnimatedSwitch } from '@/hooks/useAnimatedSwitch'
 import { cn } from '@/lib/utils'
 
@@ -355,12 +356,11 @@ export default function KbDetail() {
             onCancelUpload={jobs.cancelUpload}
             onRefresh={refreshInventory}
             onDelete={onDeleteDocument}
-            jobs={jobs.jobs}
-            selectedJobId={jobs.selectedJobId}
-            selectedFiles={jobs.selectedFiles}
+            taskFiles={jobs.taskFiles}
             selectedLogs={jobs.selectedLogs}
             selectedRunning={jobs.selectedRunning}
-            onSelectJob={jobs.selectJob}
+            selectedCancelling={jobs.selectedCancelling}
+            onRetryFile={jobs.retryFile}
           />
         ) : section === 'legal-graph' ? (
           <LegalGraphView kb={id} />
@@ -1154,8 +1154,10 @@ function DocumentReaderDrawer({
   )
 }
 
-/** Documents section: upload dropzone + uploaded-document list + remote
- *  connector cards. Moved verbatim from the old Sources tab body. */
+type DocumentsTab = 'jobs' | 'documents' | 'remote'
+
+/** Documents workspace: compiling work, the source library, and planned remote
+ * sources each get a focused tab instead of competing in one long scroll. */
 
 function DocumentsPane({
   kb,
@@ -1169,12 +1171,11 @@ function DocumentsPane({
   onCancelUpload,
   onRefresh,
   onDelete,
-  jobs,
-  selectedJobId,
-  selectedFiles,
+  taskFiles,
   selectedLogs,
   selectedRunning,
-  onSelectJob,
+  selectedCancelling,
+  onRetryFile,
 }: {
   kb: string
   documents: WikiDocument[]
@@ -1187,14 +1188,15 @@ function DocumentsPane({
   onCancelUpload: () => void
   onRefresh: () => void
   onDelete: (identifier: string) => Promise<void>
-  jobs: JobSummary[]
-  selectedJobId: string | null
-  selectedFiles: UploadFileState[]
-  selectedLogs: string[]
+  taskFiles: CompileTaskFile[]
+  selectedLogs: UploadLogLine[]
   selectedRunning: boolean
-  onSelectJob: (id: string) => void
+  selectedCancelling: boolean
+  onRetryFile: (file: CompileTaskFile) => void
 }) {
   const { t } = useTranslation(['kb', 'common'])
+  const reduce = useReducedMotion()
+  const [activeTab, setActiveTab] = useState<DocumentsTab>('jobs')
   // Inline delete confirm: `confirmName` is the row awaiting confirmation;
   // `deletingName` is the row whose remove request is in flight.
   const [confirmName, setConfirmName] = useState<string | null>(null)
@@ -1292,173 +1294,100 @@ function DocumentsPane({
     }
   }
 
+  const beginUpload = useCallback(
+    (files: File[]) => {
+      if (files.length === 0) return
+      setActiveTab('jobs')
+      onUpload(files)
+    },
+    [onUpload],
+  )
+
   return (
     <>
-    <div className="h-full overflow-y-auto scroll-edge-top">
-      <div className="max-w-[1280px] mx-auto px-8 lg:px-12 py-6">
-        <p className="text-[13px] text-muted-foreground">
-          {t('kb:upload.note')}
-        </p>
-
-        {/* Upload dropzone (real /api/v1/add) */}
-        <div
-          onDragOver={(e) => {
-            e.preventDefault()
-            onDragActiveChange(true)
-          }}
-          onDragLeave={() => onDragActiveChange(false)}
-          onDrop={(e) => {
-            e.preventDefault()
-            onDragActiveChange(false)
-            onUpload(Array.from(e.dataTransfer.files))
-          }}
-          onClick={() => !uploading && fileInputRef.current?.click()}
-          className={cn(
-            'mt-4 rounded-2xl border-2 border-dashed px-6 py-9 grid place-items-center text-center cursor-pointer transition-colors',
-            dragActive
-              ? 'border-accent-brand bg-accent-brand/5'
-              : 'border-[hsl(var(--glass-border))] hover:border-foreground/20 glass-2',
-            uploading && 'pointer-events-none opacity-70',
-          )}
-        >
+      <div className="h-full overflow-y-auto scroll-edge-top">
+        <div className="mx-auto max-w-[1120px] px-6 py-7 lg:px-10">
           <input
             ref={fileInputRef}
             type="file"
             multiple
             className="hidden"
             onChange={(e) => {
-              onUpload(Array.from(e.target.files ?? []))
+              beginUpload(Array.from(e.target.files ?? []))
               e.target.value = ''
             }}
           />
-          {uploading ? (
-            <div className="flex items-center gap-2 text-[13px] text-muted-foreground">
-              <Loader2 className="w-4 h-4 animate-spin" />{t('kb:upload.inProgress')}
-            </div>
-          ) : (
-            <>
-              <Upload className="w-6 h-6 text-muted-foreground" />
-              <div className="mt-2 text-[13.5px] font-medium text-foreground">{t('kb:upload.dropzone')}</div>
-              <div className="mt-1 text-[12px] text-muted-foreground">{t('kb:upload.dropzoneHint')}</div>
-            </>
-          )}
-        </div>
 
-        {/* Compile jobs: selectable list + the selected job's files and log
-            (client-side hash dedup, live SSE tail, re-attachable on refresh). */}
-        <JobsPanel
-          jobs={jobs}
-          selectedJobId={selectedJobId}
-          selectedFiles={selectedFiles}
-          selectedLogs={selectedLogs}
-          selectedRunning={selectedRunning}
-          onSelectJob={onSelectJob}
-          onCancelUpload={onCancelUpload}
-        />
-
-        {/* Uploaded documents (real /api/v1/list) */}
-        <div className="mt-6 flex items-center justify-between">
-          <h2 className="text-[13.5px] font-semibold text-foreground">{t('kb:docs.heading', { count: documents.length })}</h2>
-          <button
-            onClick={() => onRefresh()}
-            className="inline-flex items-center gap-1.5 h-7 px-2.5 rounded-lg border border-[hsl(var(--glass-border))] text-[12px] font-medium text-muted-foreground hover:bg-accent transition-colors"
-          >
-            <RefreshCw className="w-3 h-3" />{t('common:actions.refresh')}
-          </button>
-        </div>
-        <div className="mt-3 space-y-2">
-          {invError && (
-            <div className="rounded-lg bg-red-50 dark:bg-red-500/10 border border-red-200/70 dark:border-red-500/25 px-3 py-2 text-[12px] text-red-600 dark:text-red-400">
-              {t('kb:loadError', { error: invError })}
-            </div>
-          )}
-          {!invError && documents.length === 0 && (
-            <div className="rounded-2xl border border-dashed border-[hsl(var(--glass-border))] py-10 text-center text-[13px] text-muted-foreground">
-              {t('kb:docs.empty')}
-            </div>
-          )}
-          {documents.map((d, i) => (
-            <div
-              key={d.hash || d.name || i}
-              className={cn(
-                'anim-fade-up rounded-2xl border border-[hsl(var(--glass-border))] glass-2 px-4 py-3 flex items-center gap-3',
-                'transition-colors hover:border-foreground/20',
-                `anim-d${Math.min(i + 1, 4)}`,
-              )}
-            >
-              {/* The open-reader target is a real <button> covering the icon +
-                  title; the delete control is a SIBLING (not nested), so keyboard
-                  activation of delete never bubbles into opening the reader and
-                  no event-propagation guard is needed. */}
-              <button
-                type="button"
-                onClick={() => openDocAt(d)}
-                title={t('kb:docs.reader.open')}
-                className="flex min-w-0 flex-1 items-center gap-3 text-left rounded-xl cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-brand/50"
-              >
-                <span className="w-9 h-9 rounded-xl bg-muted border border-[hsl(var(--glass-border))] grid place-items-center shrink-0">
-                  <FileText className="w-4 h-4 text-muted-foreground" />
-                </span>
-                <div className="min-w-0">
-                  <div className="text-[13.5px] font-medium text-foreground truncate">{d.name}</div>
-                  <div className="text-[12px] text-muted-foreground mt-0.5">
-                    {d.display_type}
-                    {d.pages != null && <> · {t('kb:docs.pages', { count: d.pages })}</>}
-                  </div>
-                </div>
-              </button>
-              {/* Trailing controls: hash chip + delete, siblings of the open button. */}
-              <div className="flex items-center gap-2 shrink-0">
-                {d.hash && (
-                  <span className="font-mono2 text-[11px] text-muted-foreground bg-muted rounded px-1.5 py-0.5">
-                    {d.hash.slice(0, 8)}
-                  </span>
-                )}
-                {d.name &&
-                  (confirmName === d.name ? (
-                    <div className="flex items-center gap-1.5">
-                      <span className="text-[11.5px] text-muted-foreground">{t('kb:docs.delete.prompt')}</span>
-                      <button
-                        onClick={() => handleDelete(d.name)}
-                        disabled={deletingName === d.name}
-                        className="inline-flex items-center gap-1 h-7 px-2 rounded-lg text-[12px] font-medium text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors disabled:opacity-60"
-                      >
-                        {deletingName === d.name && <Loader2 className="w-3 h-3 animate-spin" />}
-                        {t('kb:docs.delete.confirm')}
-                      </button>
-                      <button
-                        onClick={() => setConfirmName(null)}
-                        disabled={deletingName === d.name}
-                        className="inline-flex items-center h-7 px-2 rounded-lg text-[12px] font-medium text-muted-foreground hover:bg-accent hover:text-foreground transition-colors disabled:opacity-60"
-                      >
-                        {t('kb:docs.delete.cancel')}
-                      </button>
-                    </div>
-                  ) : (
-                    <button
-                      onClick={() => setConfirmName(d.name)}
-                      title={t('kb:docs.delete.action')}
-                      aria-label={t('kb:docs.delete.action')}
-                      className="grid h-7 w-7 place-items-center rounded-lg text-muted-foreground hover:bg-red-50 dark:hover:bg-red-500/10 hover:text-red-600 dark:hover:text-red-400 transition-colors"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </button>
-                  ))}
+          <div className="flex flex-col gap-5 border-b border-[hsl(var(--glass-border))] pb-5 sm:flex-row sm:items-end sm:justify-between">
+            <div>
+              <div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-accent-brand">
+                <span className="h-1.5 w-1.5 rounded-full bg-accent-brand" />
+                {t('kb:workspace.eyebrow')}
               </div>
+              <h2 className="mt-2 text-[25px] font-bold tracking-tight text-foreground">{t('kb:workspace.title')}</h2>
+              <p className="mt-1.5 max-w-xl text-[13px] leading-relaxed text-muted-foreground">{t('kb:upload.note')}</p>
             </div>
-          ))}
-        </div>
+            <button
+              type="button"
+              onClick={() => !uploading && fileInputRef.current?.click()}
+              disabled={uploading}
+              className="inline-flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-lg bg-accent-brand px-3.5 text-[12.5px] font-semibold text-white shadow-sm transition hover:bg-accent-brand/90 disabled:cursor-wait disabled:opacity-60"
+            >
+              {uploading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Plus className="h-3.5 w-3.5" />}
+              {uploading ? t('kb:upload.inProgress') : t('kb:workspace.addFiles')}
+            </button>
+          </div>
 
-        {/* Remote connectors: no backend. Reframed as GitHub feature-request voting; never fake a connected state. */}
-        <h2 className="mt-8 text-[13.5px] font-semibold text-foreground">{t('kb:remote.heading')}</h2>
-        <p className="mt-1 text-[12px] text-muted-foreground">
-          {t('kb:remote.note')}
-        </p>
-        <div className="mt-3">
-          <ConnectorCards />
+          <Tabs value={activeTab} onValueChange={(value) => setActiveTab(value as DocumentsTab)} className="mt-5 gap-0">
+            <TabsList className="h-auto w-full justify-start gap-1 overflow-x-auto rounded-none border-b border-[hsl(var(--glass-border))] bg-transparent p-0">
+              <WorkspaceTab value="jobs" icon={ListChecks} label={t('kb:workspace.tabs.jobs')} count={taskFiles.length} />
+              <WorkspaceTab value="documents" icon={FolderOpen} label={t('kb:workspace.tabs.documents')} count={documents.length} />
+              <WorkspaceTab value="remote" icon={Cloud} label={t('kb:workspace.tabs.remote')} />
+            </TabsList>
+          </Tabs>
+
+          <AnimatePresence mode="wait" initial={false}>
+            <motion.div
+              key={activeTab}
+              initial={reduce ? false : { opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={reduce ? undefined : { opacity: 0, y: -5 }}
+              transition={reduce ? { duration: 0.1 } : { duration: 0.18, ease: 'easeOut' }}
+              className="py-6"
+            >
+              {activeTab === 'jobs' && (
+                <CompileJobsTab
+                  dragActive={dragActive}
+                  uploading={uploading}
+                  onDragActiveChange={onDragActiveChange}
+                  onUpload={beginUpload}
+                  onChooseFiles={() => fileInputRef.current?.click()}
+                  taskFiles={taskFiles}
+                  documents={documents}
+                  selectedLogs={selectedLogs}
+                  selectedRunning={selectedRunning}
+                  selectedCancelling={selectedCancelling}
+                  onCancelUpload={onCancelUpload}
+                  onRetryFile={onRetryFile}
+                />
+              )}
+              {activeTab === 'documents' && (
+                <UploadedDocumentsTab
+                  documents={documents}
+                  invError={invError}
+                  confirmName={confirmName}
+                  deletingName={deletingName}
+                  onRefresh={onRefresh}
+                  onOpen={openDocAt}
+                  onConfirmDelete={setConfirmName}
+                  onDelete={handleDelete}
+                />
+              )}
+              {activeTab === 'remote' && <RemoteSourcesTab />}
+            </motion.div>
+          </AnimatePresence>
         </div>
       </div>
-    </div>
     <DocumentReaderDrawer
       doc={openDoc}
       body={readerBody}
@@ -1477,5 +1406,232 @@ function DocumentsPane({
       onClose={closeDrawer}
     />
     </>
+  )
+}
+
+function WorkspaceTab({
+  value,
+  icon: Icon,
+  label,
+  count,
+}: {
+  value: DocumentsTab
+  icon: LucideIcon
+  label: string
+  count?: number
+}) {
+  return (
+    <TabsTrigger
+      value={value}
+      className="group h-10 flex-none gap-2 rounded-none border-x-0 border-t-0 border-b-2 border-transparent px-3 text-[12.5px] font-medium text-muted-foreground shadow-none transition-colors hover:text-foreground data-[state=active]:border-accent-brand data-[state=active]:bg-transparent data-[state=active]:text-foreground data-[state=active]:shadow-none"
+    >
+      <Icon className="h-3.5 w-3.5" />
+      {label}
+      {count != null && (
+        <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10.5px] leading-none text-muted-foreground group-data-[state=active]:bg-accent-brand/10 group-data-[state=active]:text-accent-brand">
+          {count}
+        </span>
+      )}
+    </TabsTrigger>
+  )
+}
+
+function CompileJobsTab({
+  dragActive,
+  uploading,
+  onDragActiveChange,
+  onUpload,
+  onChooseFiles,
+  taskFiles,
+  documents,
+  selectedLogs,
+  selectedRunning,
+  selectedCancelling,
+  onCancelUpload,
+  onRetryFile,
+}: {
+  dragActive: boolean
+  uploading: boolean
+  onDragActiveChange: (active: boolean) => void
+  onUpload: (files: File[]) => void
+  onChooseFiles: () => void
+  taskFiles: CompileTaskFile[]
+  documents: WikiDocument[]
+  selectedLogs: UploadLogLine[]
+  selectedRunning: boolean
+  selectedCancelling: boolean
+  onCancelUpload: () => void
+  onRetryFile: (file: CompileTaskFile) => void
+}) {
+  const { t } = useTranslation('kb')
+  return (
+    <div className="grid gap-6 lg:grid-cols-[240px_minmax(0,1fr)]">
+      <section>
+        <div className="flex items-baseline justify-between gap-4">
+          <div>
+            <h3 className="text-[14px] font-semibold text-foreground">{t('workspace.createTask')}</h3>
+            <p className="mt-1 text-[12px] text-muted-foreground">{t('workspace.createTaskNote')}</p>
+          </div>
+        </div>
+        <div
+          onDragOver={(e) => {
+            e.preventDefault()
+            onDragActiveChange(true)
+          }}
+          onDragLeave={() => onDragActiveChange(false)}
+          onDrop={(e) => {
+            e.preventDefault()
+            onDragActiveChange(false)
+            onUpload(Array.from(e.dataTransfer.files))
+          }}
+          onClick={() => !uploading && onChooseFiles()}
+          className={cn(
+            'mt-3 min-h-[88px] cursor-pointer rounded-xl border-2 border-dashed px-3 py-3 text-left transition-all duration-200',
+            'flex items-center gap-3',
+            dragActive
+              ? 'border-accent-brand bg-accent-brand/[0.07] shadow-[inset_0_0_0_1px_hsl(var(--accent-brand)/0.1)]'
+              : 'border-[hsl(var(--glass-border))] bg-muted/[0.18] hover:border-accent-brand/50 hover:bg-accent-brand/[0.025]',
+            uploading && 'pointer-events-none opacity-70',
+          )}
+        >
+          <span className={cn('grid h-8 w-8 shrink-0 place-items-center rounded-lg transition-colors', dragActive ? 'bg-accent-brand text-white' : 'bg-background text-accent-brand shadow-sm')}>
+            {uploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+          </span>
+          <div className="min-w-0">
+            <div className="text-[12px] font-semibold text-foreground">{uploading ? t('upload.inProgress') : t('upload.dropzone')}</div>
+            <div className="mt-0.5 text-[10.5px] leading-relaxed text-muted-foreground">{t('upload.dropzoneHint')}</div>
+          </div>
+        </div>
+      </section>
+
+      <section className="min-w-0 border-t border-[hsl(var(--glass-border))] pt-5 lg:border-l lg:border-t-0 lg:pl-8 lg:pt-0">
+        <JobsPanel
+          taskFiles={taskFiles}
+          documents={documents}
+          selectedLogs={selectedLogs}
+          selectedRunning={selectedRunning}
+          selectedCancelling={selectedCancelling}
+          onCancelUpload={onCancelUpload}
+          onRetryFile={onRetryFile}
+        />
+      </section>
+    </div>
+  )
+}
+
+function UploadedDocumentsTab({
+  documents,
+  invError,
+  confirmName,
+  deletingName,
+  onRefresh,
+  onOpen,
+  onConfirmDelete,
+  onDelete,
+}: {
+  documents: WikiDocument[]
+  invError: string | null
+  confirmName: string | null
+  deletingName: string | null
+  onRefresh: () => void
+  onOpen: (document: WikiDocument) => void
+  onConfirmDelete: (name: string | null) => void
+  onDelete: (name: string) => Promise<void>
+}) {
+  const { t } = useTranslation(['kb', 'common'])
+  return (
+    <section>
+      <div className="flex items-end justify-between gap-4">
+        <div>
+          <h3 className="text-[14px] font-semibold text-foreground">{t('docs.heading', { count: documents.length })}</h3>
+          <p className="mt-1 text-[12px] text-muted-foreground">{t('workspace.libraryNote')}</p>
+        </div>
+        <button
+          type="button"
+          onClick={onRefresh}
+          className="inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+        >
+          <RefreshCw className="h-3.5 w-3.5" />{t('common:actions.refresh')}
+        </button>
+      </div>
+      <div className="mt-5 border-y border-[hsl(var(--glass-border))]">
+        {invError && (
+          <div className="my-3 rounded-lg border border-red-200/70 bg-red-50 px-3 py-2 text-[12px] text-red-600 dark:border-red-500/25 dark:bg-red-500/10 dark:text-red-400">
+            {t('loadError', { error: invError })}
+          </div>
+        )}
+        {!invError && documents.length === 0 && (
+          <div className="py-14 text-center text-[13px] text-muted-foreground">{t('docs.empty')}</div>
+        )}
+        {documents.map((d, i) => (
+          <div
+            key={d.hash || d.name || i}
+            className="group flex items-center gap-3 border-b border-[hsl(var(--glass-border))] py-3 last:border-b-0"
+          >
+            <button
+              type="button"
+              onClick={() => onOpen(d)}
+              title={t('docs.reader.open')}
+              className="flex min-w-0 flex-1 items-center gap-3 rounded-lg text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-brand/50"
+            >
+              <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-muted text-muted-foreground transition-colors group-hover:bg-accent-brand/10 group-hover:text-accent-brand">
+                <FileText className="h-4 w-4" />
+              </span>
+              <span className="min-w-0">
+                <span className="block truncate text-[13px] font-medium text-foreground">{d.name}</span>
+                <span className="mt-0.5 block text-[11.5px] text-muted-foreground">
+                  {d.display_type}
+                  {d.pages != null && <> · {t('docs.pages', { count: d.pages })}</>}
+                </span>
+              </span>
+            </button>
+            <div className="flex shrink-0 items-center gap-2">
+              {d.hash && <span className="hidden rounded bg-muted px-1.5 py-0.5 font-mono2 text-[10.5px] text-muted-foreground sm:inline">{d.hash.slice(0, 8)}</span>}
+              {d.name && (confirmName === d.name ? (
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => void onDelete(d.name)}
+                    disabled={deletingName === d.name}
+                    className="inline-flex h-7 items-center gap-1 rounded-md px-2 text-[11.5px] font-medium text-red-600 transition-colors hover:bg-red-50 disabled:opacity-60 dark:text-red-400 dark:hover:bg-red-500/10"
+                  >
+                    {deletingName === d.name && <Loader2 className="h-3 w-3 animate-spin" />}
+                    {t('docs.delete.confirm')}
+                  </button>
+                  <button type="button" onClick={() => onConfirmDelete(null)} className="h-7 rounded-md px-2 text-[11.5px] text-muted-foreground hover:bg-accent">
+                    {t('docs.delete.cancel')}
+                  </button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => onConfirmDelete(d.name)}
+                  title={t('docs.delete.action')}
+                  aria-label={t('docs.delete.action')}
+                  className="grid h-7 w-7 place-items-center rounded-lg text-muted-foreground opacity-0 transition-all hover:bg-red-50 hover:text-red-600 group-hover:opacity-100 focus:opacity-100 dark:hover:bg-red-500/10 dark:hover:text-red-400"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </button>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  )
+}
+
+function RemoteSourcesTab() {
+  const { t } = useTranslation('kb')
+  return (
+    <section>
+      <div className="max-w-2xl">
+        <h3 className="text-[14px] font-semibold text-foreground">{t('remote.heading')}</h3>
+        <p className="mt-1 text-[12px] leading-relaxed text-muted-foreground">{t('remote.note')}</p>
+      </div>
+      <div className="mt-6 border-y border-[hsl(var(--glass-border))] py-5">
+        <ConnectorCards />
+      </div>
+    </section>
   )
 }

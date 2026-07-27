@@ -123,6 +123,13 @@ class AddResponse(BaseModel):
     failed_count: int
 
 
+class JobRetryRequest(BaseModel):
+    """Retry one failed file from a retained server-owned add job."""
+
+    kb: str = Field(..., min_length=1)
+    file_index: int = Field(..., ge=0)
+
+
 class KbRequest(BaseModel):
     kb: str = Field(..., min_length=1)
 

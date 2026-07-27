@@ -11,12 +11,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from typing import Any, AsyncIterator
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
-from openkb.api_helpers import require_bearer_token
+from openkb.api_helpers import _resolve_kb, require_bearer_token
+from openkb.api_ingest import start_add_job
+from openkb.api_models import JobRetryRequest
+from openkb.config import resolve_credential_bundle
 from openkb.jobs import Job, JobRegistry
 
 jobs_router = APIRouter()
@@ -72,6 +76,71 @@ async def cancel_job_endpoint(
     job = _job_or_404(_registry(request), job_id)
     job.cancel()
     return {"id": job.id, "cancel_requested": True, "status": job.status}
+
+
+def _retry_source_file(job: Job, file_index: int, raw_dir: Path) -> tuple[Path, str]:
+    """Return one failed add file retained in ``raw/``, or raise a safe 4xx.
+
+    The source path comes from this job's own replayable ``uploaded`` event,
+    never from the request. It is resolved and constrained below ``raw/`` so a
+    stale or malformed in-memory event cannot be used to read arbitrary files.
+    """
+    uploaded = next(
+        (
+            frame["data"]
+            for frame in job._events
+            if frame["event"] == "uploaded" and frame["data"].get("file_index") == file_index
+        ),
+        None,
+    )
+    completed = next(
+        (
+            frame["data"]
+            for frame in job._events
+            if frame["event"] == "file_done" and frame["data"].get("file_index") == file_index
+        ),
+        None,
+    )
+    if uploaded is None or completed is None or completed.get("status") != "failed":
+        raise HTTPException(status_code=409, detail="Only failed add files can be retried.")
+    original_name = uploaded.get("original_name")
+    saved_path = uploaded.get("saved_path")
+    if not isinstance(original_name, str) or not isinstance(saved_path, str):
+        raise HTTPException(status_code=409, detail="The failed file cannot be retried.")
+    raw_root = raw_dir.resolve()
+    candidate = Path(saved_path).resolve()
+    if not candidate.is_relative_to(raw_root) or not candidate.is_file():
+        raise HTTPException(status_code=409, detail="The retained source file is no longer available.")
+    return candidate, original_name
+
+
+@jobs_router.post("/api/v1/jobs/{job_id}/retry")
+async def retry_job_file_endpoint(
+    request: Request,
+    job_id: str,
+    body: JobRetryRequest,
+    _: None = Depends(require_bearer_token),
+) -> dict[str, Any]:
+    """Start a fresh add job for one failed file retained in the KB's raw dir."""
+    source_job = _job_or_404(_registry(request), job_id)
+    if source_job.kind != "add" or source_job.kb != body.kb:
+        raise HTTPException(status_code=404, detail="Add job not found for this knowledge base.")
+    kb_dir = _resolve_kb(body.kb)
+    source_file, original_name = _retry_source_file(source_job, body.file_index, kb_dir / "raw")
+    retry_job = start_add_job(
+        _registry(request),
+        body.kb,
+        kb_dir,
+        [(source_file, original_name)],
+        bundle=resolve_credential_bundle(kb_dir),
+    )
+    return {
+        "job_id": retry_job.id,
+        "kb": body.kb,
+        "status": retry_job.status,
+        "retry_of": source_job.id,
+        "file_index": body.file_index,
+    }
 
 
 @jobs_router.get("/api/v1/jobs/{job_id}/events")

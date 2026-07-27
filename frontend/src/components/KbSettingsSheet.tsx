@@ -47,6 +47,26 @@ export default function KbSettingsSheet({
   // is null and its default close-autofocus would drop focus to <body>.
   const openerRef = useRef<HTMLElement | null>(null)
 
+  // Radix's modal scroll lock can cancel wheel events before they reach this
+  // drawer's own `overflow-y-auto` body. Keep the page locked ourselves while
+  // using a non-modal Dialog, so wheel input remains available to the drawer.
+  useEffect(() => {
+    if (!open) return
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      const target = e.target as HTMLElement | null
+      if (target?.tagName === 'INPUT' || target?.tagName === 'TEXTAREA' || target?.isContentEditable) return
+      onClose()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.body.style.overflow = previousOverflow
+      window.removeEventListener('keydown', onKeyDown)
+    }
+  }, [open, onClose])
+
   // Radix Dialog (composed around the existing motion spring via asChild +
   // forceMount) supplies the modal a11y: focus trap, initial focus into the
   // sheet, and Escape-to-close. We add aria-modal explicitly (this compose path
@@ -56,6 +76,7 @@ export default function KbSettingsSheet({
   return (
     <Dialog.Root
       open={open}
+      modal={false}
       onOpenChange={(next) => {
         // Any Radix-initiated close (Escape, pointer-outside) routes through
         // the single onClose the parent owns. Idempotent, so a scrim click that
@@ -66,22 +87,23 @@ export default function KbSettingsSheet({
       <AnimatePresence>
         {open && (
           <Dialog.Portal forceMount>
-            <Dialog.Overlay asChild forceMount>
-              <motion.div
-                className="fixed inset-0 z-40 bg-black/30"
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                transition={reduce ? { duration: 0.12 } : { duration: 0.2 }}
-                onClick={(e) => {
-                  // Only close when the backdrop itself is clicked, not when
-                  // the click bubbles from the content (which can happen if the
-                  // overlay is technically the event target in some framer-motion
-                  // + Radix combinations).
-                  if (e.target === e.currentTarget) onClose()
-                }}
-              />
-            </Dialog.Overlay>
+            {/* Radix does not render Dialog.Overlay for a non-modal dialog,
+                so keep the visual backdrop and its explicit close behavior
+                as a regular motion element. */}
+            <motion.div
+              className="fixed inset-0 z-40 bg-black/30"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={reduce ? { duration: 0.12 } : { duration: 0.2 }}
+              onClick={(e) => {
+                // Only close when the backdrop itself is clicked, not when
+                // the click bubbles from the content (which can happen if the
+                // overlay is technically the event target in some framer-motion
+                // + Radix combinations).
+                if (e.target === e.currentTarget) onClose()
+              }}
+            />
             <Dialog.Content
               asChild
               forceMount

@@ -462,6 +462,9 @@ def _llm_call(
         _response_format_rejected.add(model)
         kwargs.pop("response_format")
         response = litellm.completion(model=model, messages=messages, **kwargs)
+    # A request already in flight cannot be force-stopped safely, but do not
+    # let its response advance the compile after the user has cancelled.
+    check_cancelled()
     content = response.choices[0].message.content or ""
     truncated = _warn_if_truncated(response, step_name, kwargs.get("max_tokens"))
 
@@ -528,6 +531,9 @@ async def _llm_call_async(
         _response_format_rejected.add(model)
         kwargs.pop("response_format")
         response = await litellm.acompletion(model=model, messages=messages, **kwargs)
+    # The concurrent page calls may all have been started before cancellation.
+    # Stop as soon as this request returns, before parsing or writing its page.
+    check_cancelled()
     content = response.choices[0].message.content or ""
     truncated = _warn_if_truncated(response, step_name, kwargs.get("max_tokens"))
 
@@ -1710,6 +1716,7 @@ async def _compile_concepts(
         response_format=_JSON_RESPONSE_FORMAT,
         bundle=bundle,
     )
+    check_cancelled()
 
     def _write_v1_summary_stripped() -> None:
         """Fallback writer for the v1 summary on early-return paths.
@@ -2063,6 +2070,9 @@ async def _compile_concepts(
             asyncio.gather(*tasks, return_exceptions=True),
             asyncio.gather(*entity_tasks, return_exceptions=True),
         )
+    # Every page request above can have been in flight when cancellation was
+    # requested. Wait for them to settle, then bail out before any wiki write.
+    check_cancelled()
 
     if tasks:
         failure_types: list[str] = []
@@ -2114,6 +2124,7 @@ async def _compile_concepts(
 
     # Strip ghost wikilinks from entity bodies and write each page.
     for name, page_content, brief, etype in entity_pending:
+        check_cancelled()
         cleaned, ghosts = strip_ghost_wikilinks(page_content, known_targets)
         if ghosts:
             logger.info(
@@ -2132,6 +2143,7 @@ async def _compile_concepts(
     # whitelist includes existing files + this round's planned slugs +
     # the summary for this document.
     for i, (name, page_content, is_update, brief) in enumerate(pending_writes):
+        check_cancelled()
         cleaned, ghosts = strip_ghost_wikilinks(page_content, known_targets)
         if ghosts:
             logger.info(
@@ -2150,6 +2162,7 @@ async def _compile_concepts(
     # response, exception) we fall back to the v1 summary stripped against
     # the full whitelist, so the summary is always written and never wiped.
     if rewrite_summary:
+        check_cancelled()
         candidate: str | None = None
         try:
             # No max_tokens cap — matches the v1 summary call. The rewrite
@@ -2211,10 +2224,12 @@ async def _compile_concepts(
                     doc_name,
                     fallback_ghosts[:5],
                 )
+        check_cancelled()
         _write_summary(wiki_dir, doc_name, final_summary, description=doc_brief)
 
     # --- Write concept pages to disk ---
     for name, page_content, is_update, brief in pending_writes:
+        check_cancelled()
         _write_concept(
             wiki_dir,
             name,
@@ -2227,11 +2242,13 @@ async def _compile_concepts(
     # --- Step 3b: Process related items (code only, no LLM) ---
     sanitized_related = [_sanitize_concept_name(s) for s in related_items]
     for slug in sanitized_related:
+        check_cancelled()
         _add_related_link(wiki_dir, slug, doc_name, source_file)
 
     # --- Step 3c: Backlink — summary ↔ concepts (code only) ---
     all_concept_slugs = concept_names + sanitized_related
     if all_concept_slugs:
+        check_cancelled()
         _backlink_summary(wiki_dir, doc_name, all_concept_slugs)
         _backlink_concepts(wiki_dir, doc_name, all_concept_slugs)
 
@@ -2239,18 +2256,20 @@ async def _compile_concepts(
     # Reuse _add_related_link (page_dir="entities") so related-entity
     # cross-refs are written in the same "See also:" form the concept path
     # uses — and torn down symmetrically by _remove_doc_from_pages.
-    entity_related_slugs = [
-        slug
-        for slug in (_sanitize_concept_name(s) for s in entity_related)
-        if _add_related_link(wiki_dir, slug, doc_name, source_file, page_dir="entities")
-    ]
+    entity_related_slugs: list[str] = []
+    for slug in (_sanitize_concept_name(s) for s in entity_related):
+        check_cancelled()
+        if _add_related_link(wiki_dir, slug, doc_name, source_file, page_dir="entities"):
+            entity_related_slugs.append(slug)
 
     entity_backlink_slugs = entity_names + entity_related_slugs
     if entity_backlink_slugs:
+        check_cancelled()
         _backlink_summary_entities(wiki_dir, doc_name, entity_backlink_slugs)
         _backlink_entities(wiki_dir, doc_name, entity_backlink_slugs)
 
     # --- Step 4: Update index (code only) ---
+    check_cancelled()
     _update_index(
         wiki_dir,
         doc_name,
@@ -2318,6 +2337,7 @@ async def compile_short_doc(
         response_format=_JSON_RESPONSE_FORMAT,
         bundle=bundle,
     )
+    check_cancelled()
     try:
         summary_parsed = _parse_json(summary_raw)
         doc_brief = summary_parsed.get("description", "")
@@ -2385,6 +2405,7 @@ async def compile_long_doc(
         fm_block = _set_fm_line(fm_block, "type", "Summary")
         updated = fm_block + body
         if updated != summary_content:
+            check_cancelled()
             summary_content = updated
             atomic_write_text(summary_path, summary_content)
 
@@ -2410,6 +2431,7 @@ async def compile_long_doc(
 
     # --- Step 1: Generate overview ---
     overview = _llm_call(model, [system_msg, doc_msg], "overview", bundle=bundle)
+    check_cancelled()
 
     # --- Steps 2-4: Concept plan → generate/update → index ---
     try:

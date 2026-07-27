@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1686,6 +1687,49 @@ class TestCompileConceptsPlan:
                 )
 
         return wiki
+
+    @pytest.mark.asyncio
+    async def test_cancel_after_page_request_does_not_write_results(self, tmp_path, monkeypatch):
+        """A cancel received while a page request is in flight stops before writes.
+
+        The provider call itself cannot be killed safely, but its returned
+        content must never reach the wiki after the UI requested cancellation.
+        """
+        from openkb.ingest_cancel import IngestCancelled, cancel_event_var
+
+        wiki = self._setup_wiki(tmp_path)
+        cancelled = threading.Event()
+        token = cancel_event_var.set(cancelled)
+
+        def fake_llm(_model, _messages, label, **_kwargs):
+            assert label == "concepts-plan"
+            return json.dumps(
+                {"create": [{"name": "stopped", "title": "Stopped"}], "update": [], "related": []}
+            )
+
+        async def fake_llm_async(_model, _messages, _label, **_kwargs):
+            # Simulate a user cancelling while the request was already active.
+            cancelled.set()
+            return json.dumps({"description": "brief", "content": "# Must not be written"})
+
+        monkeypatch.setattr("openkb.agent.compiler._llm_call", fake_llm)
+        monkeypatch.setattr("openkb.agent.compiler._llm_call_async", fake_llm_async)
+        try:
+            with pytest.raises(IngestCancelled):
+                await _compile_concepts(
+                    wiki,
+                    tmp_path,
+                    "model",
+                    {"role": "system", "content": "x"},
+                    {"role": "user", "content": "x"},
+                    "summary",
+                    "test-doc",
+                    max_concurrency=1,
+                )
+        finally:
+            cancel_event_var.reset(token)
+
+        assert not (wiki / "concepts" / "stopped.md").exists()
 
     @pytest.mark.asyncio
     async def test_create_and_update_flow(self, tmp_path):

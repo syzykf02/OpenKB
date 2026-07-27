@@ -756,14 +756,11 @@ def test_add_endpoint_starts_job_and_replays_its_events(monkeypatch, kb_dir):
         assert summary["result"]["added_count"] == 1
 
         events = _job_events(client, job_id)
-        assert [e["event"] for e in events] == [
-            "start",
-            "uploaded",
-            "file_start",
-            "file_done",
-            "final",
-            "done",
-        ]
+        names = [e["event"] for e in events]
+        assert names[0] == "start" and names[-2:] == ["final", "done"]
+        assert "uploaded" in names and "file_start" in names and "file_done" in names
+        assert names.count("file_progress") == 2
+        assert names.count("log") >= 2
         assert events[0]["data"]["kb"] == kb
         # Frames carry monotonic SSE ids (the re-attach cursor).
         assert [e["id"] for e in events] == list(range(len(events)))
@@ -773,7 +770,48 @@ def test_add_endpoint_starts_job_and_replays_its_events(monkeypatch, kb_dir):
             f"/api/v1/jobs/{job_id}/events", params={"last_seq": cursor}, headers=_auth()
         )
         tail = _events_from_sse(response.text)
-        assert [e["event"] for e in tail] == ["file_done", "final", "done"]
+        assert tail[-1]["event"] == "done"
+        assert "file_done" in [e["event"] for e in tail]
+
+
+def test_retry_failed_add_file_starts_a_fresh_job(monkeypatch, kb_dir):
+    """A failed add keeps its raw file and can be re-run without uploading it again."""
+    client = _client(monkeypatch)
+    kb = _use_named_kb(monkeypatch, kb_dir)
+
+    from openkb.cli import AddFileResult
+
+    attempts = 0
+
+    def fake_add(path, target_kb, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return AddFileResult(path.name, None, "failed", "temporary compiler failure")
+        return AddFileResult(path.name, str(path), "added", "compiled after retry")
+
+    monkeypatch.setattr("openkb.api_helpers._add_for_api", fake_add)
+
+    with client:
+        response = client.post(
+            "/api/v1/add",
+            data={"kb": kb, "stream": "true"},
+            files=[("files", ("paper.md", b"# Paper", "text/markdown"))],
+            headers=_auth(),
+        )
+        first_job_id = response.json()["job_id"]
+        assert _wait_for_job(client, first_job_id)["status"] == "done"
+
+        retry = client.post(
+            f"/api/v1/jobs/{first_job_id}/retry",
+            json={"kb": kb, "file_index": 0},
+            headers=_auth(),
+        )
+        assert retry.status_code == 200
+        retry_job_id = retry.json()["job_id"]
+        assert retry_job_id != first_job_id
+        assert _wait_for_job(client, retry_job_id)["status"] == "done"
+        assert attempts == 2
 
 
 def test_unknown_kb_returns_400(monkeypatch, tmp_path):

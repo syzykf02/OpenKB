@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import type { TFunction } from 'i18next'
 import { toast } from 'sonner'
 import {
   cancelJob,
   listJobs,
+  retryJobFile,
   startUpload,
   streamJobEvents,
   type AddResult,
@@ -34,11 +35,27 @@ export interface UploadFileState {
    *  `file_done` events carry this index; `null` rows are never matched by
    *  events. */
   uploadIndex: number | null
+  /** Structured worker progress. Each add uses prepare → compile → finalize. */
+  completedSteps: number
+  totalSteps: number
+  step: string
+}
+
+export interface UploadLogLine {
+  message: string
+  level: string
+  logger: string
+}
+
+/** One file in the all-history compile list, annotated with its source job. */
+export interface CompileTaskFile extends UploadFileState {
+  jobId: string
+  createdAt: number
 }
 
 interface JobData {
   files: UploadFileState[]
-  logs: string[]
+  logs: UploadLogLine[]
 }
 
 const TERMINAL = new Set<JobSummary['status']>(['done', 'failed', 'cancelled'])
@@ -117,13 +134,16 @@ export interface UseJobsResult {
    *  optimistically until the next poll confirms it. */
   jobs: JobSummary[]
   selectedJobId: string | null
-  selectedFiles: UploadFileState[]
-  selectedLogs: string[]
+  /** Files from live jobs and retained completed-job results, newest first. */
+  taskFiles: CompileTaskFile[]
+  selectedLogs: UploadLogLine[]
   /** True while any job is non-terminal (queued/running) - drives the dropzone
    *  disabled state and the "compiling" indicator. */
   uploading: boolean
   /** True when the SELECTED job is non-terminal - drives the Cancel button. */
   selectedRunning: boolean
+  /** True after this client has asked the server to cancel the selected job. */
+  selectedCancelling: boolean
   /** Select a job to view its files + log. Re-attaches the SSE stream (replays
    *  history from the ring, then tails live if still running). */
   selectJob: (id: string | null) => void
@@ -132,6 +152,8 @@ export interface UseJobsResult {
   doUpload: (files: File[]) => void
   /** Cancel the selected job (cooperative; the in-flight mutation rolls back). */
   cancelUpload: () => void
+  /** Re-run one failed file from its retained source file. */
+  retryFile: (file: CompileTaskFile) => void
 }
 
 /**
@@ -157,6 +179,7 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
   const [serverJobs, setServerJobs] = useState<JobSummary[]>([])
   const [jobData, setJobData] = useState<Record<string, JobData>>({})
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null)
+  const [cancellingJobIds, setCancellingJobIds] = useState<Set<string>>(new Set())
 
   // Refs mirror state for use inside stable callbacks / async loops without
   // re-creating them (which would restart the attach effect).
@@ -198,7 +221,17 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
         const idx = cur.files.findIndex((f) => f.uploadIndex === ev.index)
         const files =
           idx >= 0
-            ? cur.files.map((f, i) => (i === idx ? { ...f, status: 'processing' as UploadStatus } : f))
+            ? cur.files.map((f, i) =>
+                i === idx
+                  ? {
+                      ...f,
+                      status: 'processing' as UploadStatus,
+                      completedSteps: ev.completed_steps ?? 0,
+                      totalSteps: ev.total_steps || f.totalSteps || 3,
+                      step: ev.step ?? 'prepare',
+                    }
+                  : f,
+              )
             : [
                 ...cur.files,
                 {
@@ -206,8 +239,27 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
                   name: ev.original_name,
                   status: 'processing' as UploadStatus,
                   uploadIndex: ev.index,
+                  completedSteps: ev.completed_steps ?? 0,
+                  totalSteps: ev.total_steps || 3,
+                  step: ev.step ?? 'prepare',
                 },
               ]
+        return { ...prev, [jobId]: { ...cur, files } }
+      })
+    } else if (ev.type === 'file_progress') {
+      setJobData((prev) => {
+        const cur = prev[jobId] ?? { files: [], logs: [] }
+        const files = cur.files.map((f) =>
+          f.uploadIndex === ev.index
+            ? {
+                ...f,
+                completedSteps: ev.completed_steps,
+                totalSteps: ev.total_steps,
+                step: ev.step,
+                message: ev.message || f.message,
+              }
+            : f,
+        )
         return { ...prev, [jobId]: { ...cur, files } }
       })
     } else if (ev.type === 'file_done') {
@@ -218,7 +270,16 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
         const files =
           idx >= 0
             ? cur.files.map((f, i) =>
-                i === idx ? { ...f, status, message: ev.file.message } : f,
+                i === idx
+                  ? {
+                      ...f,
+                      status,
+                      message: ev.file.message,
+                      completedSteps: ev.completed_steps ?? (status === 'added' || status === 'skipped' ? 3 : f.completedSteps),
+                      totalSteps: ev.total_steps || f.totalSteps || 3,
+                      step: ev.step ?? (status === 'added' || status === 'skipped' ? 'finalize' : f.step),
+                    }
+                  : f,
               )
             : [
                 ...cur.files,
@@ -228,6 +289,9 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
                   status,
                   message: ev.file.message,
                   uploadIndex: ev.index,
+                  completedSteps: ev.completed_steps ?? (status === 'added' || status === 'skipped' ? 3 : 0),
+                  totalSteps: ev.total_steps || 3,
+                  step: ev.step ?? (status === 'added' || status === 'skipped' ? 'finalize' : 'compile'),
                 },
               ]
         return { ...prev, [jobId]: { ...cur, files } }
@@ -238,8 +302,8 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
         // Keep the panel bounded on very long compiles.
         const logs =
           cur.logs.length >= 500
-            ? [...cur.logs.slice(cur.logs.length - 499), ev.message]
-            : [...cur.logs, ev.message]
+            ? [...cur.logs.slice(cur.logs.length - 499), { message: ev.message, level: ev.level, logger: ev.logger }]
+            : [...cur.logs, { message: ev.message, level: ev.level, logger: ev.logger }]
         return { ...prev, [jobId]: { ...cur, logs } }
       })
     } else if (ev.type === 'cancelled') {
@@ -265,6 +329,12 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
     (jobId: string, status: string, result: AddResult | null, error: string) => {
       if (notifiedRef.current.has(jobId)) return
       notifiedRef.current.add(jobId)
+      setCancellingJobIds((ids) => {
+        if (!ids.has(jobId)) return ids
+        const next = new Set(ids)
+        next.delete(jobId)
+        return next
+      })
       if (notifyJobIdRef.current === jobId) {
         fireCompletionToast(tRef.current, status, result, error)
       }
@@ -326,6 +396,7 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
     setJobData({})
     setServerJobs([])
     setSelectedJobId(null)
+    setCancellingJobIds(new Set())
     notifyJobIdRef.current = null
     notifiedRef.current = new Set()
     prevStatusRef.current = {}
@@ -360,6 +431,11 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
             }
             prevStatusRef.current[j.id] = j.status
           }
+          setCancellingJobIds((ids) => {
+            const active = new Set(jobs.filter((j) => !isTerminal(j)).map((j) => j.id))
+            const next = new Set([...ids].filter((id) => active.has(id)))
+            return next.size === ids.size ? ids : next
+          })
         })
         .catch(() => {})
     }
@@ -402,12 +478,18 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
               name: h.file.name,
               status: 'exists',
               uploadIndex: null,
+              completedSteps: 3,
+              totalSteps: 3,
+              step: 'finalize',
             }
           : {
               id: String(rowIdSeq.current++),
               name: h.file.name,
               status: 'pending',
               uploadIndex: uploadIdx++,
+              completedSteps: 0,
+              totalSteps: 3,
+              step: 'prepare',
             },
       )
 
@@ -461,21 +543,100 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
     if (!id) return
     const job = serverJobsRef.current.find((j) => j.id === id)
     if (!job || isTerminal(job)) return
-    cancelJob(id).catch((e) => toast.error(errMsg(e)))
+    setCancellingJobIds((ids) => new Set(ids).add(id))
+    cancelJob(id).catch((e) => {
+      setCancellingJobIds((ids) => {
+        const next = new Set(ids)
+        next.delete(id)
+        return next
+      })
+      toast.error(errMsg(e))
+    })
   }, [])
+
+  const retryFile = useCallback(
+    async (file: CompileTaskFile) => {
+      const sourceJobId = file.jobId
+      if (file.status !== 'failed' || file.uploadIndex == null) return
+      let accepted: { job_id: string; status: string }
+      try {
+        accepted = await retryJobFile(sourceJobId, kb, file.uploadIndex)
+      } catch (e) {
+        toast.error(errMsg(e))
+        return
+      }
+      const jobId = accepted.job_id
+      const row: UploadFileState = {
+        id: String(rowIdSeq.current++),
+        name: file.name,
+        status: 'pending',
+        uploadIndex: 0,
+        completedSteps: 0,
+        totalSteps: 3,
+        step: 'prepare',
+      }
+      setServerJobs((prev) => [
+        ...prev,
+        {
+          id: jobId,
+          kind: 'add',
+          kb,
+          title: `retry: ${file.name}`,
+          status: accepted.status as JobSummary['status'],
+          created_at: Date.now() / 1000,
+          started_at: null,
+          finished_at: null,
+          result: null,
+          error: null,
+          last_seq: -1,
+        },
+      ])
+      prevStatusRef.current[jobId] = accepted.status as JobSummary['status']
+      setJobData((prev) => ({ ...prev, [jobId]: { files: [row], logs: [] } }))
+      notifyJobIdRef.current = jobId
+      notifiedRef.current.delete(jobId)
+      selectJob(jobId)
+    },
+    [kb, selectJob],
+  )
+
+  const taskFiles = useMemo(() => {
+    const files: CompileTaskFile[] = []
+    for (const job of serverJobs) {
+      if (job.kind !== 'add') continue
+      const streamed = jobData[job.id]?.files
+      const source = streamed?.length
+        ? streamed
+        : (job.result?.files ?? []).map((file, index) => ({
+            id: `${job.id}:${index}`,
+            name: file.original_name,
+            status: file.status as UploadStatus,
+            message: file.message,
+            uploadIndex: index,
+            completedSteps: file.status === 'added' || file.status === 'skipped' ? 3 : 2,
+            totalSteps: 3,
+            step: file.status === 'added' || file.status === 'skipped' ? 'finalize' : 'compile',
+          }))
+      files.push(...source.map((file) => ({ ...file, jobId: job.id, createdAt: job.created_at })))
+    }
+    return files.sort((a, b) => b.createdAt - a.createdAt)
+  }, [jobData, serverJobs])
 
   const selectedData = selectedJobId ? jobData[selectedJobId] : undefined
   const selectedRunning = !!selectedJobId && !!serverJobs.find((j) => j.id === selectedJobId && !isTerminal(j))
+  const selectedCancelling = !!selectedJobId && cancellingJobIds.has(selectedJobId)
 
   return {
     jobs: serverJobs,
     selectedJobId,
-    selectedFiles: selectedData?.files ?? [],
+    taskFiles,
     selectedLogs: selectedData?.logs ?? [],
     uploading: hasActive,
     selectedRunning,
+    selectedCancelling,
     selectJob,
     doUpload,
     cancelUpload,
+    retryFile,
   }
 }

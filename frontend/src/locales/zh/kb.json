@@ -22,12 +22,15 @@
     "dropzoneHint": "支持 PDF / Word / Markdown / 文本等，可多选",
     "progressHeading": "上传进度 · {{count}}",
     "cancel": "取消编译",
+    "cancelling": "正在取消…",
+    "retry": "重试",
     "cancelledToast": "已取消编译：进行中的文件已回滚",
     "logHeading": "编译日志",
+    "logEmpty": "暂无日志，任务开始后会在这里实时显示",
     "fileStatus": {
       "pending": "等待中",
       "processing": "编译中…",
-      "added": "已新增",
+      "added": "编译完成",
       "skipped": "已跳过",
       "exists": "已存在",
       "failed": "失败",
@@ -40,6 +43,13 @@
     "selectHint": "选择任务以查看文件与日志",
     "filesLabel": "{{count}} 个文件",
     "allExist": "{{count}} 个文件均已存在，未上传",
+    "fileFirstNote": "上传后立即开始编译；每个文件独立显示进度和结果。",
+    "stepCount": "{{completed}} / {{total}} 步",
+    "steps": {
+      "prepare": "准备文件",
+      "compile": "正在解析与编译",
+      "finalize": "完成收尾"
+    },
     "status": {
       "queued": "排队中",
       "running": "进行中",
@@ -108,6 +118,19 @@
   "remote": {
     "heading": "远程数据源",
     "note": "云端连接器开发中，尚不可用 · 想要它？点卡片去 GitHub 投票"
+  },
+  "workspace": {
+    "eyebrow": "文档工作台",
+    "title": "管理知识来源",
+    "addFiles": "添加文件",
+    "createTask": "新建编译任务",
+    "createTaskNote": "上传后会自动解析并编译到此知识库。",
+    "libraryNote": "查看原始文档，或移除不再需要的来源。",
+    "tabs": {
+      "jobs": "编译任务",
+      "documents": "已上传文档",
+      "remote": "远程数据源"
+    }
   },
   "overview": {
     "index": { "label": "索引", "caption": "wiki 根" },

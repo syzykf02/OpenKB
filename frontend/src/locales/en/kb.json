@@ -22,12 +22,15 @@
     "dropzoneHint": "PDF / Word / Markdown / text and more; multi-select supported",
     "progressHeading": "Upload progress · {{count}}",
     "cancel": "Cancel",
+    "cancelling": "Cancelling…",
+    "retry": "Retry",
     "cancelledToast": "Compile cancelled — the in-flight file was rolled back",
     "logHeading": "Compile log",
+    "logEmpty": "No log entries yet. Live updates will appear here when the task starts.",
     "fileStatus": {
       "pending": "Waiting",
       "processing": "Compiling…",
-      "added": "Added",
+      "added": "Compiled",
       "skipped": "Skipped",
       "exists": "Already in KB",
       "failed": "Failed",
@@ -40,6 +43,13 @@
     "selectHint": "Select a job to view its files and log",
     "filesLabel": "{{count}} file(s)",
     "allExist": "All {{count}} file(s) are already in the KB - nothing uploaded",
+    "fileFirstNote": "Upload starts compilation immediately; each file shows its own progress and result.",
+    "stepCount": "{{completed}} / {{total}} steps",
+    "steps": {
+      "prepare": "Preparing source",
+      "compile": "Parsing and compiling",
+      "finalize": "Finalizing"
+    },
     "status": {
       "queued": "Queued",
       "running": "Running",
@@ -108,6 +118,19 @@
   "remote": {
     "heading": "Remote data sources",
     "note": "Cloud connectors are in development and not yet available · want one? Click a card to vote on GitHub"
+  },
+  "workspace": {
+    "eyebrow": "Document workspace",
+    "title": "Manage knowledge sources",
+    "addFiles": "Add files",
+    "createTask": "Create a compile task",
+    "createTaskNote": "Files are parsed and compiled into this knowledge base automatically.",
+    "libraryNote": "Review source documents or remove sources you no longer need.",
+    "tabs": {
+      "jobs": "Compile jobs",
+      "documents": "Uploaded documents",
+      "remote": "Remote sources"
+    }
   },
   "overview": {
     "index": { "label": "Index", "caption": "wiki root" },
