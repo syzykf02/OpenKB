@@ -212,7 +212,7 @@ export default function Settings() {
                     value={model}
                     disabled={loading || !config}
                     onChange={(e) => setModel(e.target.value)}
-                    placeholder="gpt-5.4"
+                    placeholder="deepseek/deepseek-v4-flash"
                     className={inputCls}
                   />
                 </div>

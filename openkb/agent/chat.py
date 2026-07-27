@@ -908,6 +908,7 @@ def build_chat_session_agent(
     kb_dir: Path,
     session: ChatSession,
     bundle: "LlmCredentialBundle | None" = None,
+    legal: bool = False,
 ) -> Any:
     """Build the write- and skill-capable agent for one chat session (REST ``/chat``).
 
@@ -920,7 +921,7 @@ def build_chat_session_agent(
 
     config = resolve_effective_config(kb_dir)[0]
     language = session.language or config.get("language", "en")
-    return build_chat_agent(kb_dir, session.model, language=language, bundle=bundle)
+    return build_chat_agent(kb_dir, session.model, language=language, bundle=bundle, legal=legal)
 
 
 async def iter_chat_turn_events(

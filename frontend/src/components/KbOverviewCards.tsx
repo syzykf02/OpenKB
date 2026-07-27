@@ -1,5 +1,5 @@
 import {
-  List, Network, Users, FileText, ClipboardCheck, FolderInput, type LucideIcon,
+  List, Network, Users, FileText, ClipboardCheck, FolderInput, Scale, History, RefreshCw, type LucideIcon,
 } from 'lucide-react'
 import { motion, useReducedMotion } from 'motion/react'
 import { useTranslation } from 'react-i18next'
@@ -8,6 +8,7 @@ import type { KbInventory } from '@/api/wiki'
 
 export type Section =
   | 'index' | 'concepts' | 'entities' | 'summaries' | 'reports' | 'documents'
+  | 'legal-graph' | 'lifecycle' | 'sync-sources'
 
 interface NavCard {
   section: Section
@@ -58,10 +59,19 @@ export default function KbOverviewCards({
     { section: 'documents', label: t('overview.documents.label'), value: docCount, caption: t('overview.documents.caption'), icon: FolderInput,
       chip: 'bg-slate-100 text-slate-600 dark:bg-slate-500/15 dark:text-slate-300',
       num: 'text-slate-600 dark:text-slate-300' },
+    { section: 'legal-graph', label: t('overview.legalGraph.label'), value: -1, caption: t('overview.legalGraph.caption'), icon: Scale,
+      chip: 'bg-indigo-100 text-indigo-600 dark:bg-indigo-500/15 dark:text-indigo-400',
+      num: 'text-indigo-600 dark:text-indigo-400' },
+    { section: 'lifecycle', label: t('overview.lifecycle.label'), value: -1, caption: t('overview.lifecycle.caption'), icon: History,
+      chip: 'bg-rose-100 text-rose-600 dark:bg-rose-500/15 dark:text-rose-400',
+      num: 'text-rose-600 dark:text-rose-400' },
+    { section: 'sync-sources', label: t('overview.syncSources.label'), value: -1, caption: t('overview.syncSources.caption'), icon: RefreshCw,
+      chip: 'bg-teal-100 text-teal-600 dark:bg-teal-500/15 dark:text-teal-400',
+      num: 'text-teal-600 dark:text-teal-400' },
   ]
 
   return (
-    <div className="mt-3 grid grid-cols-3 gap-2.5 lg:grid-cols-6">
+    <div className="mt-3 grid grid-cols-3 gap-2.5 lg:grid-cols-9">
       {cards.map((c) => {
         const on = c.section === active
         return (
@@ -86,7 +96,7 @@ export default function KbOverviewCards({
                 <span className="text-[12px] font-semibold text-foreground">{c.label}</span>
               </div>
               <div className={cn('mt-1.5 text-[24px] font-bold leading-none tabular-nums tracking-tight', c.num)}>
-                {c.value}
+                {c.value >= 0 ? c.value : '·'}
               </div>
               <div className="mt-1 text-[11px] text-muted-foreground">{c.caption}</div>
             </div>

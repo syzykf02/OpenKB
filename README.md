@@ -129,7 +129,7 @@ openkb-web                       # serves the API + Workbench at http://127.0.0.
 
 Open `http://127.0.0.1:7566/` for the Workbench. Auth is off by default (local-first); set `OPENKB_API_TOKEN` to require a bearer token before exposing the server. See the [full Web UI guide](examples/rest-api/README.md#knowledge-workbench-web-ui).
 
-> Working on the UI itself? Run the Vite dev server with `cd frontend && npm install && npm run dev` (it proxies `/api` to a running `openkb-web`), or `npm run build` to regenerate the bundled `openkb/web/`.
+> Working on the UI itself? Run the Vite dev server with `cd frontend && pnpm install && pnpm run dev` (it proxies `/api` to a running `openkb-web`), or `pnpm run build` to regenerate the bundled `openkb/web/`.
 
 # 🧩 How OpenKB Works
 
@@ -252,7 +252,7 @@ Inside a chat, type `/` to access slash commands (Tab to complete).
 OpenKB settings are initialized by `openkb init` and stored in `.openkb/config.yaml`:
 
 ```yaml
-model: gpt-5.4                   # LLM model (any LiteLLM-supported provider)
+model: deepseek/deepseek-v4-flash # LLM model (any LiteLLM-supported provider)
 language: en                     # Wiki output language
 pageindex_threshold: 20          # PDF pages threshold for PageIndex
 ```

@@ -33,13 +33,45 @@ def _use_named_kb(monkeypatch, kb_dir, name: str = "test-kb") -> str:
 
 
 def _events_from_sse(text: str) -> list[dict[str, Any]]:
+    """Parse an SSE body into [{event, data, id?}]. Tolerates `id:` lines
+    (job streams use them as re-attach cursors) and comment keep-alives."""
     events: list[dict[str, Any]] = []
     for block in text.strip().split("\n\n"):
         lines = block.splitlines()
-        event = lines[0].removeprefix("event: ")
-        data = json.loads(lines[1].removeprefix("data: "))
-        events.append({"event": event, "data": data})
+        event_line = next((ln for ln in lines if ln.startswith("event: ")), None)
+        data_line = next((ln for ln in lines if ln.startswith("data: ")), None)
+        if event_line is None or data_line is None:
+            continue  # keep-alive comment or malformed block
+        id_line = next((ln for ln in lines if ln.startswith("id: ")), None)
+        parsed = {
+            "event": event_line.removeprefix("event: "),
+            "data": json.loads(data_line.removeprefix("data: ")),
+        }
+        if id_line is not None:
+            parsed["id"] = int(id_line.removeprefix("id: "))
+        events.append(parsed)
     return events
+
+
+def _wait_for_job(client, job_id: str, timeout: float = 10.0) -> dict[str, Any]:
+    """Poll GET /api/v1/jobs/{id} until the job reaches a terminal status."""
+    import time
+
+    deadline = time.time() + timeout
+    body: dict[str, Any] = {}
+    while time.time() < deadline:
+        body = client.get(f"/api/v1/jobs/{job_id}", headers=_auth()).json()
+        if body["status"] in ("done", "failed", "cancelled"):
+            return body
+        time.sleep(0.02)
+    raise AssertionError(f"job {job_id} did not finish in time: {body}")
+
+
+def _job_events(client, job_id: str) -> list[dict[str, Any]]:
+    """Replay a finished job's full event history via the re-attach stream."""
+    response = client.get(f"/api/v1/jobs/{job_id}/events", headers=_auth())
+    assert response.status_code == 200
+    return _events_from_sse(response.text)
 
 
 def test_no_token_configured_disables_auth(monkeypatch, tmp_path):
@@ -690,7 +722,10 @@ def test_add_endpoint_removes_skipped_upload(monkeypatch, kb_dir):
     assert response.json()["skipped_count"] == 1
 
 
-def test_add_endpoint_streams_events(monkeypatch, kb_dir):
+def test_add_endpoint_starts_job_and_replays_its_events(monkeypatch, kb_dir):
+    """Streaming add starts a server-owned job (survives disconnect/refresh):
+    the POST returns the job id immediately, and the job's full event history
+    is replayable via /api/v1/jobs/{id}/events."""
     client = _client(monkeypatch)
     kb = _use_named_kb(monkeypatch, kb_dir)
 
@@ -701,26 +736,44 @@ def test_add_endpoint_streams_events(monkeypatch, kb_dir):
 
     monkeypatch.setattr("openkb.api_helpers._add_for_api", fake_add)
 
-    response = client.post(
-        "/api/v1/add",
-        data={"kb": kb, "stream": "true"},
-        files=[("files", ("paper.md", b"# Paper", "text/markdown"))],
-        headers=_auth(),
-    )
+    # Context manager so every request shares the app's event loop — the job
+    # task spawned by the POST keeps running between requests (like uvicorn).
+    with client:
+        response = client.post(
+            "/api/v1/add",
+            data={"kb": kb, "stream": "true"},
+            files=[("files", ("paper.md", b"# Paper", "text/markdown"))],
+            headers=_auth(),
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["kb"] == kb
+        assert body["status"] == "queued"
+        job_id = body["job_id"]
 
-    assert response.status_code == 200
-    assert response.headers["content-type"].startswith("text/event-stream")
-    events = _events_from_sse(response.text)
-    assert [event["event"] for event in events] == [
-        "start",
-        "uploaded",
-        "file_start",
-        "file_done",
-        "final",
-        "done",
-    ]
-    assert events[0]["data"]["kb"] == kb
-    assert events[-2]["data"]["added_count"] == 1
+        summary = _wait_for_job(client, job_id)
+        assert summary["status"] == "done"
+        assert summary["result"]["added_count"] == 1
+
+        events = _job_events(client, job_id)
+        assert [e["event"] for e in events] == [
+            "start",
+            "uploaded",
+            "file_start",
+            "file_done",
+            "final",
+            "done",
+        ]
+        assert events[0]["data"]["kb"] == kb
+        # Frames carry monotonic SSE ids (the re-attach cursor).
+        assert [e["id"] for e in events] == list(range(len(events)))
+        # Re-attaching from a mid-stream cursor replays only later frames.
+        cursor = events[2]["id"]
+        response = client.get(
+            f"/api/v1/jobs/{job_id}/events", params={"last_seq": cursor}, headers=_auth()
+        )
+        tail = _events_from_sse(response.text)
+        assert [e["event"] for e in tail] == ["file_done", "final", "done"]
 
 
 def test_unknown_kb_returns_400(monkeypatch, tmp_path):
@@ -1565,13 +1618,16 @@ def test_meta_endpoint_returns_real_version(monkeypatch):
 def test_concurrent_same_kb_lint_serialized(monkeypatch, kb_dir):
     """Two concurrent lint requests to the same KB must not overlap.
 
-    Drives the real _kb_mutation_lock closure inside create_app() via two
-    concurrent ASGI requests. Without per-KB serialization, both would run
-    simultaneously and max_seen would be 2.
+    The fix pass's serialization lives inside run_lint_report: it holds the
+    KB ingest lock across the work (acquired off-loop via the async bridge).
+    The fake mirrors that lock span; without it both would run simultaneously
+    and max_seen would be 2.
     """
     import asyncio
 
     import httpx
+
+    from openkb.async_locks import async_kb_lock
 
     monkeypatch.setenv("OPENKB_API_TOKEN", "secret")
     _use_named_kb(monkeypatch, kb_dir)
@@ -1581,10 +1637,11 @@ def test_concurrent_same_kb_lint_serialized(monkeypatch, kb_dir):
 
     async def slow_lint(kb_dir_arg, *, fix, **kwargs):
         nonlocal active, max_seen
-        active += 1
-        max_seen = max(max_seen, active)
-        await asyncio.sleep(0.1)
-        active -= 1
+        async with async_kb_lock(kb_dir_arg / ".openkb", exclusive=True):
+            active += 1
+            max_seen = max(max_seen, active)
+            await asyncio.sleep(0.1)
+            active -= 1
         return {"skipped": False, "message": "ok"}
 
     monkeypatch.setattr("openkb.api.run_lint_report", slow_lint)
@@ -1729,13 +1786,17 @@ def test_resolve_credential_bundle_falls_back_to_process_env(monkeypatch, kb_dir
 def test_concurrent_same_kb_recompile_serialized(monkeypatch, kb_dir):
     """Two concurrent non-streaming recompile requests to the same KB must not overlap.
 
-    Mirrors test_concurrent_same_kb_lint_serialized but for the recompile path,
-    which also relies on the per-KB asyncio.Lock. Without serialization both
-    async generators would be iterated concurrently and max_seen would be 2.
+    Mirrors test_concurrent_same_kb_lint_serialized but for the recompile
+    path, whose serialization lives inside iter_recompile: the whole span
+    holds the KB ingest lock (acquired off-loop via the async bridge). The
+    fake mirrors that lock span; without it both generators would be iterated
+    concurrently and max_seen would be 2.
     """
     import asyncio
 
     import httpx
+
+    from openkb.async_locks import async_kb_lock
 
     monkeypatch.setenv("OPENKB_API_TOKEN", "secret")
     _use_named_kb(monkeypatch, kb_dir)
@@ -1747,11 +1808,12 @@ def test_concurrent_same_kb_recompile_serialized(monkeypatch, kb_dir):
         kb_dir_arg, doc_name, *, all_docs, dry_run, refresh_schema, **kwargs
     ):
         nonlocal active, max_seen
-        active += 1
-        max_seen = max(max_seen, active)
-        await asyncio.sleep(0.1)
-        active -= 1
-        yield {"event": "final", "recompiled": 0, "skipped": 0}
+        async with async_kb_lock(kb_dir_arg / ".openkb", exclusive=True):
+            active += 1
+            max_seen = max(max_seen, active)
+            await asyncio.sleep(0.1)
+            active -= 1
+            yield {"event": "final", "recompiled": 0, "skipped": 0}
 
     monkeypatch.setattr("openkb.api.iter_recompile", slow_iter_recompile)
 
@@ -2147,7 +2209,7 @@ def test_kb_config_get_returns_fields_and_key_presence(monkeypatch, kb_dir):
 
     assert response.status_code == 200
     body = response.json()
-    assert body["model"] == "gpt-5.4"
+    assert body["model"] == "deepseek/deepseek-v4-flash"
     assert body["has_api_key"] is True
     assert "secret123" not in response.text
 
@@ -2528,7 +2590,7 @@ def test_global_config_get_defaults_when_absent(monkeypatch, tmp_path):
     client = _client(monkeypatch)
     body = client.get("/api/v1/config", headers=_auth()).json()
     assert body == {
-        "model": "gpt-5.4",
+        "model": "deepseek/deepseek-v4-flash",
         "language": "en",
         "pageindex_threshold": 20,
         # Default entity-type vocabulary when global.yaml sets none.
@@ -2607,7 +2669,7 @@ def test_global_config_patch_null_reverts_to_default(monkeypatch, tmp_path):
     client = _client(monkeypatch)
     response = client.patch("/api/v1/config", json={"config": {"model": None}}, headers=_auth())
     assert response.status_code == 200
-    assert response.json()["model"] == "gpt-5.4"  # back to DEFAULT_CONFIG
+    assert response.json()["model"] == "deepseek/deepseek-v4-flash"  # back to DEFAULT_CONFIG
     assert "model" not in yaml.safe_load(gp.read_text())
 
 
@@ -3017,7 +3079,7 @@ def test_global_config_endpoints_degrade_on_non_mapping_yaml(monkeypatch, tmp_pa
 
     got = client.get("/api/v1/config", headers=_auth())
     assert got.status_code == 200
-    assert got.json()["model"] == "gpt-5.4"
+    assert got.json()["model"] == "deepseek/deepseek-v4-flash"
 
     patched = client.patch("/api/v1/config", json={"config": {"model": "x"}}, headers=_auth())
     assert patched.status_code == 200
@@ -3414,3 +3476,104 @@ def test_delete_kb_filenotfound_is_idempotent(monkeypatch, tmp_path):
     )
     assert r.status_code == 200
     assert r.json()["deleted"] is True
+
+
+def test_add_job_emits_compile_log_events(monkeypatch, kb_dir):
+    """The add job forwards the worker thread's openkb.* log records into its
+    event ring as `log` frames (the UI's live compile log)."""
+    import logging
+
+    client = _client(monkeypatch)
+    kb = _use_named_kb(monkeypatch, kb_dir)
+
+    from openkb.cli import AddFileResult
+
+    def fake_add(path, target_kb, **kwargs):
+        logging.getLogger("openkb.fake_ingest").info("compiling concept pages")
+        return AddFileResult(path.name, str(path), "added", f"{path.name} added")
+
+    monkeypatch.setattr("openkb.api_helpers._add_for_api", fake_add)
+
+    with client:
+        response = client.post(
+            "/api/v1/add",
+            data={"kb": kb, "stream": "true"},
+            files=[("files", ("paper.md", b"# Paper", "text/markdown"))],
+            headers=_auth(),
+        )
+        job_id = response.json()["job_id"]
+        assert _wait_for_job(client, job_id)["status"] == "done"
+
+        events = _job_events(client, job_id)
+        names = [e["event"] for e in events]
+        assert names[0] == "start" and names[-1] == "done"
+        logs = [e for e in events if e["event"] == "log"]
+        assert any(
+            log["data"]["message"] == "compiling concept pages"
+            and log["data"]["logger"] == "openkb.fake_ingest"
+            for log in logs
+        )
+
+
+def test_add_job_cancel_endpoint_stops_batch(monkeypatch, kb_dir):
+    """POST /api/v1/jobs/{id}/cancel stops the running job cooperatively: the
+    in-flight file reports `cancelled`, later files never start, and the job
+    ends `cancelled` instead of `done` — with no `final` summary frame."""
+    import time
+
+    client = _client(monkeypatch)
+    kb = _use_named_kb(monkeypatch, kb_dir)
+
+    from openkb.ingest_cancel import cancel_event_var, check_cancelled
+
+    started: list[Path] = []
+
+    def fake_add(path, target_kb, **kwargs):
+        started.append(path)
+        assert cancel_event_var.get() is not None, "cancel flag must reach the worker"
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            check_cancelled()  # raises IngestCancelled once cancel is requested
+            time.sleep(0.01)
+        raise AssertionError("cancel was never requested")
+
+    monkeypatch.setattr("openkb.api_helpers._add_for_api", fake_add)
+
+    with client:
+        response = client.post(
+            "/api/v1/add",
+            data={"kb": kb, "stream": "true"},
+            files=[
+                ("files", ("one.md", b"# One", "text/markdown")),
+                ("files", ("two.md", b"# Two", "text/markdown")),
+            ],
+            headers=_auth(),
+        )
+        job_id = response.json()["job_id"]
+
+        # Wait until the job is actually running (past the queued state).
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            status = client.get(f"/api/v1/jobs/{job_id}", headers=_auth()).json()["status"]
+            if status == "running":
+                break
+            time.sleep(0.02)
+        assert status == "running"
+
+        cancel = client.post(f"/api/v1/jobs/{job_id}/cancel", headers=_auth())
+        assert cancel.status_code == 200
+        assert cancel.json()["cancel_requested"] is True
+
+        assert _wait_for_job(client, job_id)["status"] == "cancelled"
+
+        events = _job_events(client, job_id)
+        names = [e["event"] for e in events]
+        assert len(started) == 1  # only the first file ran; the second never started
+        assert names.count("file_start") == 1
+        cancelled_files = [
+            e for e in events if e["event"] == "file_done" and e["data"]["status"] == "cancelled"
+        ]
+        assert len(cancelled_files) == 1
+        assert cancelled_files[0]["data"]["original_name"] == "one.md"
+        assert "cancelled" in names and "final" not in names
+        assert names[-1] == "done"

@@ -21,12 +21,31 @@
     "dropzone": "拖放文件到此处，或点击选择",
     "dropzoneHint": "支持 PDF / Word / Markdown / 文本等，可多选",
     "progressHeading": "上传进度 · {{count}}",
+    "cancel": "取消编译",
+    "cancelledToast": "已取消编译：进行中的文件已回滚",
+    "logHeading": "编译日志",
     "fileStatus": {
       "pending": "等待中",
       "processing": "编译中…",
       "added": "已新增",
       "skipped": "已跳过",
-      "failed": "失败"
+      "exists": "已存在",
+      "failed": "失败",
+      "cancelled": "已取消"
+    }
+  },
+  "jobs": {
+    "heading": "编译任务 · {{count}}",
+    "empty": "暂无编译任务",
+    "selectHint": "选择任务以查看文件与日志",
+    "filesLabel": "{{count}} 个文件",
+    "allExist": "{{count}} 个文件均已存在，未上传",
+    "status": {
+      "queued": "排队中",
+      "running": "进行中",
+      "done": "完成",
+      "failed": "失败",
+      "cancelled": "已取消"
     }
   },
   "docs": {
@@ -96,7 +115,10 @@
     "entities": { "label": "实体", "caption": "人物 · 组织" },
     "summaries": { "label": "摘要", "caption": "按文档" },
     "reports": { "label": "报告", "caption": "检查 · 重编译" },
-    "documents": { "label": "文档", "caption": "已编译文档" }
+    "documents": { "label": "文档", "caption": "已编译文档" },
+    "legalGraph": { "label": "图谱", "caption": "实体 · 关系" },
+    "lifecycle": { "label": "生命周期", "caption": "置信度 · 取代" },
+    "syncSources": { "label": "同步源", "caption": "文件夹 · 同步" }
   },
   "pageList": {
     "empty": "此类型暂无页面",

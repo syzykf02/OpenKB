@@ -28,7 +28,7 @@ DEFAULT_ENTITY_TYPES: tuple[str, ...] = (
 )
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "model": "gpt-5.4",
+    "model": "deepseek/deepseek-v4-flash",
     "language": "en",
     "pageindex_threshold": 20,
     # A GLOBAL_SCALAR_KEY like the three above, so the merged `effective` dict

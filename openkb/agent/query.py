@@ -213,6 +213,7 @@ def build_chat_agent(
     model: str,
     language: str = "en",
     bundle: "LlmCredentialBundle | None" = None,
+    legal: bool = False,
 ) -> Agent:
     """Build the chat agent: query agent + a write tool restricted to
     ``<kb>/wiki/explorations/**`` and ``<kb>/output/**`` + a ``ShellTool``
@@ -328,7 +329,66 @@ def build_chat_agent(
             "your default tools."
         )
 
-    new_instructions = (base.instructions or "") + skill_instructions_addendum
+    legal_instructions_addendum = ""
+    if legal:
+        # Legal retrieval tools (UI_INTEGRATION_PLAN §4): node-level DocIR
+        # access, graph traversal, on-demand vision, and citation verification.
+        from openkb.agent.docir_tools import read_node, render_page, search_docir
+        from openkb.agent.legal_tools import find_impact, query_graph
+        from openkb.citation import format_verification, verify_citation
+
+        @function_tool
+        def legal_search(query: str) -> str:
+            """BM25 search over DocIR node text. Use FIRST for statute numbers
+            (第N条), case numbers, or precise legal terms. Returns node ids."""
+            return search_docir(query, wiki_root)
+
+        @function_tool
+        def legal_read_node(node_id: str) -> str:
+            """Read a DocIR node by id or typed URI (docir:// / law:// / case://)."""
+            return read_node(node_id, wiki_root)
+
+        @function_tool
+        def legal_query_graph(entity: str, relation: str, depth: int = 2) -> str:
+            """Traverse typed legal relations (cites/applies/revises/...) from an entity."""
+            return query_graph(entity, relation, kb_root, depth=depth)
+
+        @function_tool
+        def legal_find_impact(entity: str) -> str:
+            """Impact analysis: what cases/concepts/rules reference this entity."""
+            return find_impact(entity, kb_root)
+
+        @function_tool
+        def legal_render_page(doc_name: str, page: str) -> str:
+            """Vision gate: render a page for visual analysis ONLY when text cannot
+            answer (charts/signatures/scans). Text-first: skip if text suffices."""
+            import json as _json
+
+            return _json.dumps(render_page(doc_name, page, kb_root), ensure_ascii=False)
+
+        @function_tool
+        def legal_verify_citation(claim: str, source_uri: str) -> str:
+            """Verify a claim's citation (existence/recency/consistency). Call for
+            every legal claim; reports superseded/repealed sources."""
+            return format_verification(verify_citation(claim, source_uri, kb_dir))
+
+        extra_tools.extend([
+            legal_search, legal_read_node, legal_query_graph,
+            legal_find_impact, legal_render_page, legal_verify_citation,
+        ])
+        legal_instructions_addendum = (
+            "\n\n## Legal retrieval tools\n\n"
+            "You are answering over a legal knowledge base. Use the legal_* tools: "
+            "`legal_search` (BM25, first for statute/case numbers), `legal_read_node` "
+            "(fetch a node by docir://law://case:// URI), `legal_query_graph` / "
+            "`legal_find_impact` (typed-relation traversal & impact analysis), "
+            "`legal_render_page` (vision gate - ONLY when text cannot answer), and "
+            "`legal_verify_citation` (verify EVERY claim you make; downgrade and note "
+            "history when a source is superseded/repealed). Cite a source URI for each "
+            "assertion; express confidence per the source's recency status."
+        )
+
+    new_instructions = (base.instructions or "") + skill_instructions_addendum + legal_instructions_addendum
     return base.clone(
         tools=[*base.tools, *extra_tools],
         instructions=new_instructions,

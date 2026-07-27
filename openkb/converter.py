@@ -138,6 +138,78 @@ def get_pdf_page_count(path: Path) -> int:
         return doc.page_count
 
 
+def _docir_converter_for(src: Path) -> tuple[str, str]:
+    """Map a source suffix to (DocIR input_type, converter extractor)."""
+    suffix = src.suffix.lower()
+    if suffix == ".md":
+        return "md", "md-parser"
+    if suffix == ".pdf":
+        return "pdf", "pymupdf-text"
+    if suffix in (".txt",):
+        return "txt", "passthrough"
+    if suffix in (".html", ".htm"):
+        return "html", "markitdown"
+    return suffix.lstrip(".") or "unknown", "markitdown"
+
+
+# Image files registered as visual nodes. PNG/JPEG/GIF/WebP/BMP.
+_VISUAL_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+_PAGE_IN_FILENAME = re.compile(r"p(\d+)_img", re.IGNORECASE)
+
+
+def _emit_short_doc_docir(
+    *,
+    markdown: str,
+    doc_name: str,
+    src: Path,
+    images_dir: Path,
+    sources_dir: Path,
+    file_hash: str | None,
+) -> None:
+    """Build and persist the DocIR for a short (non-long-PDF) document.
+
+    Shallow tree from the markdown + one figure_anchor visual node per
+    extracted image (page parsed from the ``pN_img`` filename convention when
+    present). Writes ``wiki/sources/<doc_name>.docir.json`` atomically. The
+    ``.md`` continues to be produced for backward compatibility.
+    """
+    from openkb.docir import (
+        EXTRACTOR_PDF_FIGURE_DETECT,
+        VISION_PHOTO,
+        create_docir_from_markdown,
+    )
+
+    input_type, converter = _docir_converter_for(src)
+    origin_uri = f"raw/{doc_name}{src.suffix.lower()}"
+    doc = create_docir_from_markdown(
+        markdown,
+        doc_name,
+        input_type=input_type,
+        converter=converter,
+        origin_uri=origin_uri,
+        content_hash=f"sha256:{file_hash}" if file_hash else None,
+    )
+
+    # Register extracted images as visual nodes (render pointer only).
+    if images_dir.exists():
+        for img in sorted(images_dir.iterdir()):
+            if img.suffix.lower() not in _VISUAL_IMAGE_SUFFIXES:
+                continue
+            page_match = _PAGE_IN_FILENAME.search(img.name)
+            page = int(page_match.group(1)) if page_match else None
+            render_ref = f"sources/images/{doc_name}/{img.name}"
+            doc.attach_visual_node(
+                page=page,
+                visual_type=VISION_PHOTO,
+                render_ref=render_ref,
+                title=img.stem,
+                extractor=EXTRACTOR_PDF_FIGURE_DETECT,
+            )
+
+    docir_path = sources_dir / f"{doc_name}.docir.json"
+    doc.save(docir_path)
+
+
 def convert_document(
     src: Path,
     kb_dir: Path,
@@ -245,6 +317,19 @@ def convert_document(
 
         dest_md = sources_dir / f"{doc_name}.md"
         atomic_write_text(dest_md, markdown)
+
+        # Emit the canonical DocIR (single .docir.json) alongside the .md.
+        # Short docs -> shallow tree (root -> sections/paragraphs); extracted
+        # images register as figure_anchor visual nodes (render pointer only,
+        # no pre-analysis). See spec/docir-format.md section 9.
+        _emit_short_doc_docir(
+            markdown=markdown,
+            doc_name=doc_name,
+            src=src,
+            images_dir=images_dir,
+            sources_dir=sources_dir,
+            file_hash=file_hash,
+        )
 
         return ConvertResult(
             raw_path=raw_dest,

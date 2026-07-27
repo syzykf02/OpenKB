@@ -8,6 +8,7 @@ import {
   ShieldCheck, Clock, Radio,
 } from 'lucide-react'
 import { toast } from 'sonner'
+import LegalSettingsSection from '@/components/legal/LegalSettingsSection'
 import { deleteKb, getKbConfig, patchKbConfig, type KbConfig, type ConfigSource } from '@/api/kb'
 import {
   watchStart, watchStop, watchStatus, runRecompile, runLint, type WatchStatus,
@@ -72,7 +73,13 @@ export default function KbSettingsSheet({
                 animate={{ opacity: 1 }}
                 exit={{ opacity: 0 }}
                 transition={reduce ? { duration: 0.12 } : { duration: 0.2 }}
-                onClick={onClose}
+                onClick={(e) => {
+                  // Only close when the backdrop itself is clicked, not when
+                  // the click bubbles from the content (which can happen if the
+                  // overlay is technically the event target in some framer-motion
+                  // + Radix combinations).
+                  if (e.target === e.currentTarget) onClose()
+                }}
               />
             </Dialog.Overlay>
             <Dialog.Content
@@ -92,6 +99,12 @@ export default function KbSettingsSheet({
                 e.preventDefault()
                 openerRef.current?.focus()
               }}
+              // Prevent Radix from treating pointer events inside the sheet as
+              // "outside" dismissals (framer-motion asChild can make the layer
+              // boundary detection miss motion.aside's surface). The overlay's
+              // own onClick below is the intentional outside-dismiss path.
+              onPointerDownOutside={(e) => e.preventDefault()}
+              onInteractOutside={(e) => e.preventDefault()}
             >
               <motion.aside
                 className="fixed inset-y-0 right-0 z-50 flex w-[420px] max-w-[92vw] flex-col glass border-l border-[hsl(var(--glass-border))] shadow-glass-lg rounded-l-apple-lg"
@@ -116,6 +129,7 @@ export default function KbSettingsSheet({
 
                 <div className="flex-1 min-h-0 overflow-y-auto scroll-edge-top px-4 py-4 space-y-6">
                   <KbConfigSection kb={kb} />
+                  <LegalSettingsSection kb={kb} />
                   <KbMaintenanceSection kb={kb} open={open} docCount={docCount} onChanged={onChanged} />
                   <KbDangerSection kb={kb} onDeleted={onDeleted} />
                 </div>

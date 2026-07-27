@@ -344,38 +344,9 @@ async def _run_add_uploads(
     return _summarize_add_results(kb, results)
 
 
-async def _stream_add_uploads(
-    kb: str,
-    kb_dir: Path,
-    saved_uploads: list[tuple[Path, str]],
-    *,
-    bundle=None,
-) -> AsyncIterator[str]:
-    yield _sse(
-        "start",
-        {"endpoint": "add", "kb": kb, "file_count": len(saved_uploads)},
-    )
-    results: list[AddFileItem] = []
-    try:
-        for saved_path, original_name in saved_uploads:
-            yield _sse(
-                "uploaded",
-                {"original_name": original_name, "saved_path": str(saved_path)},
-            )
-            yield _sse(
-                "file_start",
-                {"original_name": original_name, "saved_path": str(saved_path)},
-            )
-            item = await _add_saved_file(kb_dir, saved_path, original_name, bundle=bundle)
-            results.append(item)
-            yield _sse("file_done", _model_payload(item))
-        final = _summarize_add_results(kb, results)
-        yield _sse("final", _model_payload(final))
-    except HTTPException as exc:
-        yield _sse("error", {"message": exc.detail})
-    except Exception as exc:
-        yield _sse("error", {"message": f"Add failed: {exc}"})
-    yield _sse("done", {})
+# NOTE: the streaming add path (_stream_add_uploads) moved to
+# openkb.api_ingest.stream_add_uploads, which layers live compile logs and
+# cooperative cancellation on top of the same per-file helpers below.
 
 
 async def _add_saved_file(
@@ -472,7 +443,7 @@ async def _stream_chat(
     run_config = build_run_config_from_bundle(session.model, bundle)
     try:
         append_log(kb_dir / "wiki", "query", request.message)
-        agent = build_chat_session_agent(kb_dir, session, bundle=bundle)
+        agent = build_chat_session_agent(kb_dir, session, bundle=bundle, legal=request.legal)
         async for event in iter_chat_turn_events(
             agent, session, request.message, run_config=run_config
         ):
@@ -535,10 +506,22 @@ async def _stream_remove(
     yield _sse("done", {})
 
 
+def zip_directory_bytes(target: Path) -> bytes:
+    """Zip a directory tree in memory (skill archive download)."""
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f in target.rglob("*"):
+            if f.is_file():
+                zf.write(f, f.relative_to(target))
+    return buf.getvalue()
+
+
 async def _stream_recompile(
     request: RecompileRequest,
     kb_dir: Path,
-    mutation_lock: asyncio.Lock,
     fastapi_request: Request,
     *,
     bundle=None,
@@ -547,48 +530,45 @@ async def _stream_recompile(
 
     Maps ``iter_recompile``'s events to SSE so a streaming client can react
     to ``doc`` (ok/skipped/error) and terminal ``error`` (404/409/etc.) as
-    they happen, without waiting on an HTTP error.
+    they happen, without waiting on an HTTP error. Serialization against
+    other KB mutations happens inside ``iter_recompile`` on the portalocker
+    ingest lock, acquired off-loop (``openkb.async_locks``) — no asyncio
+    pre-lock here, so a long recompile never queues unrelated endpoints.
     """
     yield _sse("start", {"endpoint": "recompile"})
-    # Hold the per-KB asyncio.Lock for the entire stream so concurrent
-    # same-KB recompiles are serialized before kb_ingest_lock (which uses
-    # threading.local and miscounts reentrancy on the event-loop thread).
-    async with mutation_lock:
-        try:
-            async for event in iter_recompile(
-                kb_dir,
-                request.doc_name,
-                all_docs=request.all_docs,
-                dry_run=request.dry_run,
-                refresh_schema=request.refresh_schema,
-                bundle=bundle,
-            ):
-                # Cooperative stop: an aborting client (Stop / navigate-away)
-                # must let the generator exit so ``async with mutation_lock``
-                # releases the per-KB lock instead of holding it for the whole
-                # (unwatched) LLM recompile.
-                if await fastapi_request.is_disconnected():
-                    break
-                name = event.get("event")
-                if name == "error":
-                    yield _sse(
-                        "error",
-                        {
-                            "code": event.get("code", 500),
-                            "message": event.get("message", "Recompile failed."),
-                            **(
-                                {"candidates": event["candidates"]} if "candidates" in event else {}
-                            ),
-                        },
-                    )
-                elif name == "plan":
-                    yield _sse("plan", {"targets": event.get("targets", [])})
-                elif name == "doc":
-                    yield _sse("doc", {k: v for k, v in event.items() if k != "event"})
-                elif name == "final":
-                    yield _sse("final", {k: v for k, v in event.items() if k != "event"})
-        except Exception as exc:
-            yield _sse("error", {"message": f"Recompile failed: {exc}"})
+    try:
+        async for event in iter_recompile(
+            kb_dir,
+            request.doc_name,
+            all_docs=request.all_docs,
+            dry_run=request.dry_run,
+            refresh_schema=request.refresh_schema,
+            bundle=bundle,
+        ):
+            # Cooperative stop: an aborting client (Stop / navigate-away)
+            # ends the stream promptly.
+            if await fastapi_request.is_disconnected():
+                break
+            name = event.get("event")
+            if name == "error":
+                yield _sse(
+                    "error",
+                    {
+                        "code": event.get("code", 500),
+                        "message": event.get("message", "Recompile failed."),
+                        **(
+                            {"candidates": event["candidates"]} if "candidates" in event else {}
+                        ),
+                    },
+                )
+            elif name == "plan":
+                yield _sse("plan", {"targets": event.get("targets", [])})
+            elif name == "doc":
+                yield _sse("doc", {k: v for k, v in event.items() if k != "event"})
+            elif name == "final":
+                yield _sse("final", {k: v for k, v in event.items() if k != "event"})
+    except Exception as exc:
+        yield _sse("error", {"message": f"Recompile failed: {exc}"})
     yield _sse("done", {})
 
 

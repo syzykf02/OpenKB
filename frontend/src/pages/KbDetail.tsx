@@ -3,16 +3,22 @@ import { useNavigate, useParams } from 'react-router'
 import { useTranslation } from 'react-i18next'
 import * as Dialog from '@radix-ui/react-dialog'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
-import { FileText, Link2, Loader2, Pencil, Upload, RefreshCw, Settings2, Trash2, Circle, CheckCircle2, CircleSlash2, XCircle, X, BookOpen, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight } from 'lucide-react'
+import { FileText, Link2, Loader2, Pencil, Upload, RefreshCw, Settings2, Trash2, X, BookOpen, ChevronLeft, ChevronRight, ChevronDown, ChevronsLeft, ChevronsRight, Eye, ListTree } from 'lucide-react'
 import { toast } from 'sonner'
 import { deletePage, editPage, getDocumentSource, getKbInventory, getPage, getPageLinks, type DocumentSource, type KbInventory, type WikiDocument } from '@/api/wiki'
-import { streamUpload, removeDocument, type AddResult } from '@/api/maintenance'
+import { getDocirByHash, type DocirNode } from '@/api/legal'
+import { removeDocument, type JobSummary } from '@/api/maintenance'
 import { ApiError } from '@/api/client'
 import MarkdownView from '@/components/MarkdownView'
 import PageList from '@/components/PageList'
 import ConnectorCards from '@/components/ConnectorCards'
 import KbOverviewCards, { type Section } from '@/components/KbOverviewCards'
 import KbSettingsSheet from '@/components/KbSettingsSheet'
+import LegalGraphView from '@/components/legal/LegalGraphView'
+import LifecycleView from '@/components/legal/LifecycleView'
+import SyncSourcesView from '@/components/legal/SyncSourcesView'
+import JobsPanel from '@/components/JobsPanel'
+import { useJobs, type UploadFileState } from '@/hooks/useJobs'
 import { useAnimatedSwitch } from '@/hooks/useAnimatedSwitch'
 import { cn } from '@/lib/utils'
 
@@ -55,20 +61,6 @@ function stripFrontmatter(md: string): string {
   if (!m) return md
   if (!m[1].split(/\r?\n/).every(looksLikeYamlLine)) return md
   return md.slice(m[0].length)
-}
-
-/** Per-file lifecycle during a streaming upload. `pending` → `processing`
- *  (backend `file_start`) → terminal `added`/`skipped`/`failed` (`file_done`,
- *  the `AddFileItem.status`). */
-type UploadStatus = 'pending' | 'processing' | 'added' | 'skipped' | 'failed'
-interface UploadFileState {
-  /** Stable generated id, assigned once at seed time — the React key. Rows are
-   *  correlated to backend events by their array index, not this id or the
-   *  basename (two same-basename files from different folders must not collide). */
-  id: string
-  name: string
-  status: UploadStatus
-  message?: string
 }
 
 /** One selected wiki page, derived from its `<type>/<name>` path. */
@@ -125,19 +117,11 @@ export default function KbDetail() {
   const [page, setPage] = useState<{ path: string; content: string } | null>(null)
   const [pageError, setPageError] = useState<{ path: string; message: string } | null>(null)
 
-  // Documents section: upload state. `uploadFiles` tracks per-file progress
-  // for the current/most-recent streaming upload; it is reset at the start of
-  // each upload and kept afterwards so final per-file statuses stay visible.
+  // Documents section: upload + compile-jobs state. The jobs engine (polling,
+  // selectable per-job logs, client-side hash dedup) lives in `useJobs` below;
+  // only the dropzone's drag state and file input stay here.
   const fileInputRef = useRef<HTMLInputElement>(null)
-  const [uploading, setUploading] = useState(false)
-  const [uploadFiles, setUploadFiles] = useState<UploadFileState[]>([])
   const [dragActive, setDragActive] = useState(false)
-  // Monotonic counter for per-row ids (React keys), and the AbortController for
-  // the in-flight upload — aborted on unmount so navigating away mid-upload
-  // cancels the request (mirrors the recompile/chat abort discipline).
-  const rowIdSeq = useRef(0)
-  const uploadAbortRef = useRef<AbortController | null>(null)
-  useEffect(() => () => uploadAbortRef.current?.abort(), [])
 
   const selected = useMemo(() => parseSelected(selectedPath), [selectedPath])
   const openPath = useCallback((path: string) => setSelectedPath(path), [])
@@ -237,103 +221,16 @@ export default function KbDetail() {
     [refreshInventory],
   )
 
-  const doUpload = useCallback(
-    async (files: File[]) => {
-      if (files.length === 0 || uploading) return
-      setUploading(true)
-      // Seed one row per selected file so the UI shows the full set immediately,
-      // then flip each to processing/terminal as SSE events arrive. Each row gets
-      // a stable generated id (its React key); rows are correlated to backend
-      // events by array index (event order == files order), NOT by basename, so
-      // two same-basename files from different folders no longer collide.
-      setUploadFiles(files.map((f) => ({ id: String(rowIdSeq.current++), name: f.name, status: 'pending' as const })))
-      // Fresh controller for this upload — aborted on unmount.
-      const controller = new AbortController()
-      uploadAbortRef.current = controller
-      let summary: AddResult | null = null
-      let streamError: string | null = null
-      try {
-        await streamUpload(
-          id,
-          files,
-          (ev) => {
-            if (ev.type === 'file_start') {
-              setUploadFiles((prev) =>
-                prev.map((f, i) => (i === ev.index ? { ...f, status: 'processing' } : f)),
-              )
-            } else if (ev.type === 'file_done') {
-              setUploadFiles((prev) =>
-                prev.map((f, i) =>
-                  i === ev.index
-                    ? { ...f, status: ev.file.status as UploadStatus, message: ev.file.message }
-                    : f,
-                ),
-              )
-            } else if (ev.type === 'final') {
-              summary = ev.result
-            } else if (ev.type === 'error') {
-              streamError = ev.message
-            }
-          },
-          controller.signal,
-        )
-        // A stream-level `error` frame, or a stream that ends WITHOUT a `final`
-        // summary, must not leave rows spinning forever — settle any still-
-        // unresolved (pending/processing) rows to failed.
-        if (streamError || !summary) {
-          setUploadFiles((prev) =>
-            prev.map((f) =>
-              f.status === 'pending' || f.status === 'processing' ? { ...f, status: 'failed' as const } : f,
-            ),
-          )
-        }
-        // `/api/v1/add` reports HTTP 200 even when per-file compile fails, so a
-        // clean stream does NOT mean success — branch on the real
-        // added/failed/skipped counts from the `final` summary event.
-        if (streamError) {
-          toast.error(streamError)
-        } else if (summary) {
-          const res: AddResult = summary
-          const parts = [t('kb:upload.added', { count: res.added_count })]
-          if (res.skipped_count) parts.push(t('kb:upload.skipped', { count: res.skipped_count }))
-          if (res.failed_count) parts.push(t('kb:upload.failed', { count: res.failed_count }))
-          const line = parts.join(' · ')
-          if (res.added_count === 0 && res.failed_count > 0) {
-            // Every file failed — surface the first failure's message so the
-            // user learns WHY (e.g. compile error / missing LLM API key).
-            const reason = res.files.find((f) => f.status === 'failed')?.message
-            toast.error(t('kb:upload.errorToast', { summary: line }) + (reason ? t('kb:upload.reasonSuffix', { reason }) : ''))
-          } else if (res.failed_count > 0) {
-            // Some added, some failed — not a clean success.
-            toast.warning(t('kb:upload.partialToast', { summary: line }))
-          } else if (res.added_count > 0) {
-            toast.success(t('kb:upload.successToast', { summary: line }))
-          } else {
-            // Nothing added or failed (all skipped duplicates) — neutral, not
-            // an error and not a "added" success.
-            toast.info(t('kb:upload.existsToast', { summary: line }))
-          }
-        } else {
-          // Stream ended cleanly but never delivered a `final` summary and no
-          // explicit `error` frame — treat as an interrupted upload so the user
-          // isn't left with a silent no-op.
-          toast.error(t('kb:upload.incompleteToast'))
-        }
-        // Refresh regardless of outcome: a failed compile may still have
-        // written a raw file, and the user needs to see current state.
-        await refreshInventory()
-      } catch (e) {
-        // An abort (component unmounted / navigated away mid-upload) is a clean
-        // cancel: no toast, no refresh — the component is gone. Real failures
-        // still surface.
-        const aborted = controller.signal.aborted || (e as { name?: string })?.name === 'AbortError'
-        if (!aborted) toast.error(errMsg(e))
-      } finally {
-        setUploading(false)
-      }
-    },
-    [id, uploading, refreshInventory, t],
-  )
+  // Compile-jobs engine: polls `listJobs`, tails the selected job's SSE stream
+  // (re-attachable - a refresh or a click on an old job replays its rows + log
+  // from the server's event ring), and dedups uploads by SHA-256 against the
+  // KB's known document hashes so already-uploaded files aren't re-sent.
+  const jobs = useJobs(id, {
+    getKnownHashes: () =>
+      new Set((inv?.documents ?? []).map((d) => d.hash).filter(Boolean)),
+    onCompleted: refreshInventory,
+  })
+
 
   /** Remove one document via `/api/v1/remove`, then refresh + toast. The
    *  identifier is the document's original filename (`WikiDocument.name`),
@@ -380,13 +277,15 @@ export default function KbDetail() {
   )
 
   // Card selection handler: Index opens index.md, a type card auto-selects
-  // its first page, Documents shows no reader.
+  // its first page, Documents/legal views show no reader.
   const selectSection = useCallback(
     (next: Section) => {
       setSection(next)
       if (next === 'index') {
         openPath('index.md')
-      } else if (next !== 'documents') {
+      } else if (next === 'documents' || next === 'legal-graph' || next === 'lifecycle' || next === 'sync-sources') {
+        setSelectedPath(null)
+      } else {
         const first = inv?.[next]?.[0]
         setSelectedPath(first ? `${next}/${first}` : null)
       }
@@ -448,15 +347,27 @@ export default function KbDetail() {
             kb={id}
             documents={documents}
             invError={invError}
-            uploading={uploading}
-            uploadFiles={uploadFiles}
+            uploading={jobs.uploading}
             dragActive={dragActive}
             fileInputRef={fileInputRef}
             onDragActiveChange={setDragActive}
-            onUpload={doUpload}
+            onUpload={jobs.doUpload}
+            onCancelUpload={jobs.cancelUpload}
             onRefresh={refreshInventory}
             onDelete={onDeleteDocument}
+            jobs={jobs.jobs}
+            selectedJobId={jobs.selectedJobId}
+            selectedFiles={jobs.selectedFiles}
+            selectedLogs={jobs.selectedLogs}
+            selectedRunning={jobs.selectedRunning}
+            onSelectJob={jobs.selectJob}
           />
+        ) : section === 'legal-graph' ? (
+          <LegalGraphView kb={id} />
+        ) : section === 'lifecycle' ? (
+          <LifecycleView kb={id} />
+        ) : section === 'sync-sources' ? (
+          <SyncSourcesView kb={id} />
         ) : (
           <div className="h-full flex">
             <div className="w-[300px] shrink-0 border-r border-[hsl(var(--glass-border))] glass-2 flex flex-col min-h-0">
@@ -830,22 +741,6 @@ function IndexReader(props: ReaderProps) {
   )
 }
 
-/** Status glyph for one per-file upload row. */
-function UploadStatusIcon({ status }: { status: UploadStatus }) {
-  switch (status) {
-    case 'processing':
-      return <Loader2 className="w-3.5 h-3.5 animate-spin text-muted-foreground" />
-    case 'added':
-      return <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500 dark:text-emerald-400" />
-    case 'skipped':
-      return <CircleSlash2 className="w-3.5 h-3.5 text-muted-foreground" />
-    case 'failed':
-      return <XCircle className="w-3.5 h-3.5 text-red-500 dark:text-red-400" />
-    default:
-      return <Circle className="w-3.5 h-3.5 text-muted-foreground/50" />
-  }
-}
-
 /** Read-only slide-out reader for a document's converted source text.
  *
  * Presentational: the parent (DocumentsPane) owns the fetch, per-hash cache,
@@ -856,12 +751,166 @@ function UploadStatusIcon({ status }: { status: UploadStatus }) {
  * on close). The body scrolls independently and native find-in-page works (the
  * whole document is rendered, not virtualized). Documents are read-only
  * ingestion artifacts, so there is no edit affordance. */
+/** DocIR structure outline for the reader (UI_INTEGRATION_PLAN §5).
+ *  Fetches the document's DocIR by content hash and renders the recursive
+ *  section tree (part/chapter/section) with visual-node markers; clicking a node that has
+ *  a page jumps the reader to it. Hidden when no DocIR exists for the doc. */
+function DocirOutline({ kb, hash, onJumpPage }: { kb: string; hash: string; onJumpPage: (p: number) => void }) {
+  const { t } = useTranslation('legal')
+  const [open, setOpen] = useState(false)
+  const [root, setRoot] = useState<DocirNode | null>(null)
+  const [loaded, setLoaded] = useState(false)
+  useEffect(() => {
+    let cancelled = false
+    setLoaded(false)
+    setRoot(null)
+    getDocirByHash(kb, hash)
+      .then((r) => {
+        if (!cancelled) setRoot(r.docir?.root ?? null)
+      })
+      .catch(() => {
+        if (!cancelled) setRoot(null)
+      })
+      .finally(() => {
+        if (!cancelled) setLoaded(true)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [kb, hash])
+  if (!loaded || !root) return null
+  const renderNode = (n: DocirNode, depth: number): ReactNode => {
+    const isVisual = n.kind === 'figure_anchor'
+    const page = n.loc?.page ?? null
+    const hasChildren = !!n.children && n.children.length > 0
+    const label = n.title || n.vision?.text_anchor || (isVisual ? n.vision?.type : '') || n.kind
+    if (hasChildren) {
+      return (
+        <DocirToggle
+          key={n.id}
+          node={n}
+          depth={depth}
+          isVisual={isVisual}
+          page={page}
+          label={label}
+          onJumpPage={onJumpPage}
+          renderNode={renderNode}
+        />
+      )
+    }
+    // Leaf: a single row indented by depth. No toggle, no children.
+    return (
+      <div
+        key={n.id}
+        className="flex items-center gap-1 rounded px-1 py-0.5 hover:bg-[hsl(var(--glass-hover))]"
+        style={{ paddingLeft: depth * 12 }}
+      >
+        <span className="w-3 shrink-0" />
+        {isVisual ? (
+          <Eye className="h-3 w-3 shrink-0 text-amber-500" />
+        ) : (
+          <span className="w-3 shrink-0" />
+        )}
+        {page != null ? (
+          <button
+            onClick={() => onJumpPage(page)}
+            className="min-w-0 flex-1 truncate text-left text-[11.5px] text-foreground hover:underline"
+            title={String(label)}
+          >
+            {label}
+            <span className="ml-1 text-[10px] text-muted-foreground">p{page}</span>
+          </button>
+        ) : (
+          <span className="min-w-0 flex-1 truncate text-[11.5px] text-muted-foreground" title={String(label)}>
+            {label}
+          </span>
+        )}
+      </div>
+    )
+  }
+  return (
+    <div className="mb-4 rounded-lg border border-[hsl(var(--glass-border))] bg-muted/20">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-1.5 px-3 py-2 text-left text-[12px] font-semibold text-foreground"
+      >
+        {open ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+        <ListTree className="h-3.5 w-3.5 text-muted-foreground" />
+        {t('reader.structure')}
+      </button>
+      {open && <div className="border-t border-[hsl(var(--glass-border))] px-2 py-2">{renderNode(root, 0)}</div>}
+    </div>
+  )
+}
+
+/** Expandable node with children: renders its own row, then stacks descendants
+ *  vertically below it. Children MUST be siblings of the row (block flow), not
+ *  nested inside the row's flex container - otherwise they lay out horizontally
+ *  beside the toggle instead of dropping down as a sub-tree. */
+function DocirToggle({
+  node,
+  depth,
+  isVisual,
+  page,
+  label,
+  onJumpPage,
+  renderNode,
+}: {
+  node: DocirNode
+  depth: number
+  isVisual: boolean
+  page: number | null
+  label: string
+  onJumpPage: (p: number) => void
+  renderNode: (n: DocirNode, d: number) => ReactNode
+}) {
+  const [exp, setExp] = useState(depth < 1)
+  return (
+    <div>
+      <div
+        className="flex items-center gap-1 rounded px-1 py-0.5 hover:bg-[hsl(var(--glass-hover))]"
+        style={{ paddingLeft: depth * 12 }}
+      >
+        <button
+          onClick={() => setExp((v) => !v)}
+          className="grid h-3 w-3 shrink-0 place-items-center text-muted-foreground"
+          aria-label={exp ? 'collapse' : 'expand'}
+        >
+          {exp ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+        </button>
+        {isVisual ? (
+          <Eye className="h-3 w-3 shrink-0 text-amber-500" />
+        ) : (
+          <span className="w-3 shrink-0" />
+        )}
+        {page != null ? (
+          <button
+            onClick={() => onJumpPage(page)}
+            className="min-w-0 flex-1 truncate text-left text-[11.5px] text-foreground hover:underline"
+            title={String(label)}
+          >
+            {label}
+            <span className="ml-1 text-[10px] text-muted-foreground">p{page}</span>
+          </button>
+        ) : (
+          <span className="min-w-0 flex-1 truncate text-[11.5px] text-muted-foreground" title={String(label)}>
+            {label}
+          </span>
+        )}
+      </div>
+      {exp && node.children?.map((c) => renderNode(c, depth + 1))}
+    </div>
+  )
+}
+
 function DocumentReaderDrawer({
   doc,
   body,
   loading,
   error,
   isEmpty,
+  kb,
+  onJumpPage,
   page,
   totalPages,
   onFirst,
@@ -876,6 +925,8 @@ function DocumentReaderDrawer({
   loading: boolean
   error: string | null
   isEmpty: boolean
+  kb?: string
+  onJumpPage?: (p: number) => void
   page: number
   totalPages: number
   onFirst: () => void
@@ -946,7 +997,11 @@ function DocumentReaderDrawer({
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
               transition={reduce ? { duration: 0.12 } : { duration: 0.2 }}
-              onClick={onClose}
+              onClick={(e) => {
+                // Only close on the backdrop itself; clicks that originate in
+                // the content must not dismiss the drawer.
+                if (e.target === e.currentTarget) onClose()
+              }}
             />
             <Dialog.Content
               asChild
@@ -973,6 +1028,7 @@ function DocumentReaderDrawer({
                 animate={reduce ? { opacity: 1 } : { opacity: 1, x: 0 }}
                 exit={reduce ? { opacity: 0 } : { opacity: 0, x: 24 }}
                 transition={reduce ? { duration: 0.12 } : { type: 'spring', bounce: 0, duration: 0.3 }}
+                onClick={(e) => e.stopPropagation()}
               >
                 <div className="flex shrink-0 items-center gap-3 border-b border-[hsl(var(--glass-border))] px-5 py-3">
                   <span className="grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-[hsl(var(--glass-border))] bg-muted">
@@ -1029,6 +1085,9 @@ function DocumentReaderDrawer({
                           ? t('kb:docs.reader.emptyPage')
                           : t('kb:docs.reader.emptyDoc')}
                       </div>
+                    )}
+                    {!loading && !error && !isEmpty && kb && shown?.hash && onJumpPage && (
+                      <DocirOutline kb={kb} hash={shown.hash} onJumpPage={onJumpPage} />
                     )}
                     {!loading && !error && !isEmpty && (
                       <div className="text-[14px] leading-relaxed text-foreground">{body}</div>
@@ -1103,25 +1162,37 @@ function DocumentsPane({
   documents,
   invError,
   uploading,
-  uploadFiles,
   dragActive,
   fileInputRef,
   onDragActiveChange,
   onUpload,
+  onCancelUpload,
   onRefresh,
   onDelete,
+  jobs,
+  selectedJobId,
+  selectedFiles,
+  selectedLogs,
+  selectedRunning,
+  onSelectJob,
 }: {
   kb: string
   documents: WikiDocument[]
   invError: string | null
   uploading: boolean
-  uploadFiles: UploadFileState[]
   dragActive: boolean
   fileInputRef: RefObject<HTMLInputElement | null>
   onDragActiveChange: (active: boolean) => void
   onUpload: (files: File[]) => void
+  onCancelUpload: () => void
   onRefresh: () => void
   onDelete: (identifier: string) => Promise<void>
+  jobs: JobSummary[]
+  selectedJobId: string | null
+  selectedFiles: UploadFileState[]
+  selectedLogs: string[]
+  selectedRunning: boolean
+  onSelectJob: (id: string) => void
 }) {
   const { t } = useTranslation(['kb', 'common'])
   // Inline delete confirm: `confirmName` is the row awaiting confirmation;
@@ -1154,6 +1225,11 @@ function DocumentsPane({
     setDocPage(1)
     setDocTotalPages(1)
     setOpenDoc(d)
+  }, [])
+  // Jump the open reader to a specific page (used by the DocIR structure tree).
+  const jumpToPage = useCallback((p: number) => {
+    setDocPage(p)
+    setDocReloadSeq((s) => s + 1)
   }, [])
   const openHash = openDoc?.hash ?? null
 
@@ -1215,6 +1291,7 @@ function DocumentsPane({
       setConfirmName(null)
     }
   }
+
   return (
     <>
     <div className="h-full overflow-y-auto scroll-edge-top">
@@ -1267,28 +1344,17 @@ function DocumentsPane({
           )}
         </div>
 
-        {/* Per-file upload progress (streaming /api/v1/add?stream=true) */}
-        {uploadFiles.length > 0 && (
-          <div className="mt-4">
-            <h2 className="text-[13.5px] font-semibold text-foreground">
-              {t('kb:upload.progressHeading', { count: uploadFiles.length })}
-            </h2>
-            <div className="mt-2 space-y-1.5">
-              {uploadFiles.map((f) => (
-                <div
-                  key={f.id}
-                  className="rounded-xl border border-[hsl(var(--glass-border))] glass-2 px-3 py-2 flex items-center gap-2.5"
-                >
-                  <UploadStatusIcon status={f.status} />
-                  <span className="text-[13px] text-foreground truncate">{f.name}</span>
-                  <span className="ml-auto text-[11.5px] text-muted-foreground shrink-0">
-                    {t(`kb:upload.fileStatus.${f.status}`)}
-                  </span>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
+        {/* Compile jobs: selectable list + the selected job's files and log
+            (client-side hash dedup, live SSE tail, re-attachable on refresh). */}
+        <JobsPanel
+          jobs={jobs}
+          selectedJobId={selectedJobId}
+          selectedFiles={selectedFiles}
+          selectedLogs={selectedLogs}
+          selectedRunning={selectedRunning}
+          onSelectJob={onSelectJob}
+          onCancelUpload={onCancelUpload}
+        />
 
         {/* Uploaded documents (real /api/v1/list) */}
         <div className="mt-6 flex items-center justify-between">
@@ -1399,6 +1465,8 @@ function DocumentsPane({
       loading={docLoading}
       error={docError}
       isEmpty={readerEmpty}
+      kb={kb}
+      onJumpPage={jumpToPage}
       page={docSource?.page ?? docPage}
       totalPages={docSource?.total_pages ?? docTotalPages}
       onFirst={() => setDocPage(1)}

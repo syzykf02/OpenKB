@@ -12,6 +12,7 @@ from typing import Any
 from pageindex import IndexConfig, PageIndexClient
 
 from openkb.config import (
+    DEFAULT_CONFIG,
     LlmCredentialBundle,
     get_base_url,
     resolve_concurrency,
@@ -155,7 +156,102 @@ def _write_long_doc_artifacts(
     summary_path.write_text(
         render_summary_md(tree, doc_name, doc_id, description=description), encoding="utf-8"
     )
+
+    # Emit the canonical DocIR (deep tree from the PageIndex structure + per-page
+    # visual nodes). See spec/docir-format.md section 9.3 - the PageIndex tree is
+    # already close to DocIR root; we add id / loc / provenance and register page
+    # images as figure_anchor nodes (render pointer only, no pre-analysis).
+    _emit_long_doc_docir(tree, pages, doc_name, doc_id, sources_dir, description)
+
     return summary_path
+
+
+def _emit_long_doc_docir(
+    tree: dict,
+    pages: list[dict[str, Any]],
+    doc_name: str,
+    doc_id: str,
+    sources_dir: Path,
+    description: str,
+) -> None:
+    """Build and persist the DocIR for a long (PageIndex-indexed) document.
+
+    Deep tree: document root -> recursive sections from ``tree.structure``
+    (title + summary as text, ``loc.page`` from the node's ``start_index``),
+    with ``provenance.extractor = pageindex-tree``. Each page's extracted
+    images register as ``figure_anchor`` visual nodes (page + render_ref).
+    Writes ``wiki/sources/<doc_name>.docir.json`` atomically.
+    """
+    from openkb.docir import (
+        EXTRACTOR_PAGEINDEX_TREE,
+        EXTRACTOR_PDF_FIGURE_DETECT,
+        KIND_DOCUMENT,
+        KIND_SECTION,
+        VISION_PHOTO,
+        DocIRBuilder,
+    )
+
+    builder = DocIRBuilder(
+        doc_name,
+        doc_id=doc_id,
+        input_type="pdf",
+        converter=EXTRACTOR_PAGEINDEX_TREE,
+        origin_uri=f"raw/{doc_name}.pdf",
+        title=tree.get("doc_name") or doc_name,
+    )
+    builder.set_input_meta(page_count=len(pages))
+    if description:
+        builder.set_input_meta(description=description)
+
+    root_id = builder.add_node(
+        kind=KIND_DOCUMENT,
+        title=tree.get("doc_name") or doc_name,
+        text=description or "",
+        extractor=EXTRACTOR_PAGEINDEX_TREE,
+        confidence=1.0,
+    )
+
+    def _add_structure(nodes: list[dict], parent_id: str) -> None:
+        for node in nodes:
+            title = node.get("title", "") or ""
+            summary = node.get("summary", "") or ""
+            start = node.get("start_index")
+            page: int | None = None
+            if start is not None and str(start).strip().isdigit():
+                page = int(str(start).strip())
+            nid = builder.add_node(
+                kind=KIND_SECTION,
+                title=title,
+                text=summary,
+                page=page,
+                parent_id=parent_id,
+                extractor=EXTRACTOR_PAGEINDEX_TREE,
+                confidence=0.9,
+            )
+            children = node.get("nodes", []) or []
+            if children:
+                _add_structure(children, nid)
+
+    _add_structure(tree.get("structure", []) or [], root_id)
+
+    # Register per-page extracted images as visual nodes (render pointer only).
+    for page_entry in pages:
+        page_num = page_entry.get("page")
+        if not isinstance(page_num, int):
+            continue
+        for img in page_entry.get("images", []) or []:
+            path = img.get("path") if isinstance(img, dict) else None
+            if not isinstance(path, str):
+                continue
+            builder.add_visual_node(
+                page=page_num,
+                visual_type=VISION_PHOTO,
+                render_ref=path,
+                extractor=EXTRACTOR_PDF_FIGURE_DETECT,
+            )
+
+    doc = builder.build()
+    doc.save(sources_dir / f"{doc_name}.docir.json")
 
 
 def _build_index_config(
@@ -233,7 +329,7 @@ def index_long_document(
     openkb_dir = kb_dir / ".openkb"
     config = resolve_effective_config(kb_dir)[0]
 
-    model: str = config.get("model", "gpt-5.4")
+    model: str = config.get("model", DEFAULT_CONFIG["model"])
     pageindex_api_key = os.environ.get("PAGEINDEX_API_KEY", "")
 
     index_config = _build_index_config(config, bundle=bundle)

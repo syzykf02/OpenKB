@@ -34,6 +34,7 @@
   },
   "newSession": "新会话",
   "inputPlaceholder": "继续追问，或输入 / 使用命令…",
+  "legalMode": "法律模式(法条/案例检索 + 引用校验)",
   "commands": {
     "paletteHeading": "命令 · 生成器",
     "deck": { "label": "生成幻灯片", "desc": "把知识编译成单文件 HTML 演示" },

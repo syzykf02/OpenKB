@@ -17,6 +17,49 @@ MutationBody = Callable[[MutationSnapshot], None]
 PostCommitHook = Callable[[], None]
 
 
+def snapshot_add_paths(
+    kb_dir: Path,
+    doc_name: str,
+    final_raw: Path | None,
+    final_source: Path | None,
+) -> list[Path]:
+    """Build the touched-path list for an ``add`` mutation.
+
+    Covers every path a single ingest can write: the hash registry, the
+    PageIndex blob store files, the summary, the source artifacts (``.md`` /
+    per-page ``.json`` / the canonical ``.docir.json``), extracted images, the
+    concept/entity trees, and the index + log. Snapshotting these up front
+    means a mid-ingest crash rolls them all back atomically.
+
+    NOTE: ``.openkb/files`` (the PageIndex blob store) is intentionally NOT
+    snapshotted here. It is append-only by ``{doc_id}``, and the doc_id is only
+    assigned during indexing (after this snapshot). Eagerly snapshotting the
+    whole tree cost one ``os.link`` per existing blob on every add; instead the
+    long-doc add path registers just the new blob via ``snapshot.track_new()``
+    once indexing has run.
+    """
+    paths = [
+        kb_dir / ".openkb" / "hashes.json",
+        kb_dir / ".openkb" / "pageindex.db",
+        kb_dir / ".openkb" / "pageindex.db-wal",
+        kb_dir / ".openkb" / "pageindex.db-shm",
+        kb_dir / ".openkb" / "pageindex.db-journal",
+        kb_dir / "wiki" / "summaries" / f"{doc_name}.md",
+        kb_dir / "wiki" / "sources" / f"{doc_name}.json",
+        kb_dir / "wiki" / "sources" / f"{doc_name}.docir.json",
+        kb_dir / "wiki" / "sources" / "images" / doc_name,
+        kb_dir / "wiki" / "concepts",
+        kb_dir / "wiki" / "entities",
+        kb_dir / "wiki" / "index.md",
+        kb_dir / "wiki" / "log.md",
+    ]
+    if final_raw is not None:
+        paths.append(final_raw)
+    if final_source is not None:
+        paths.append(final_source)
+    return paths
+
+
 class DirtyRollbackError(RuntimeError):
     """A mutation's rollback failed, leaving an active journal on disk.
 

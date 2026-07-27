@@ -289,6 +289,12 @@ export default function ChatSession() {
   // is the modal source-page Sheet. `panelArtifact` is the currently-open
   // viewable artifact, or null when the panel is closed.
   const [panelArtifact, setPanelArtifact] = useState<Artifact | null>(null)
+  // Legal mode: when on, the chat agent gets legal retrieval tools + citation
+  // discipline (UI_INTEGRATION_PLAN §4). Persisted per-session in localStorage.
+  const [legal, setLegal] = useState<boolean>(() => localStorage.getItem("openkb_legal_mode") === "1")
+  useEffect(() => {
+    localStorage.setItem("openkb_legal_mode", legal ? "1" : "0")
+  }, [legal])
 
   // Every viewable artifact this session produced (deck + graph + chat-turn
   // files) — the panel's switcher list. Skills are archives, not viewable, so
@@ -419,7 +425,7 @@ export default function ChatSession() {
     setStoppable(true)
 
     try {
-      const stream = streamChat(activeKb, sessionIdRef.current, question, controller.signal)
+      const stream = streamChat(activeKb, sessionIdRef.current, question, controller.signal, legal)
       for await (const event of stream) {
         patch((t) => foldSseEvent(t, event, activeKb))
         if (event.event === "final" && typeof event.data?.session_id === "string") {
@@ -697,6 +703,16 @@ export default function ChatSession() {
               </button>
             </div>
           )}
+          <label className="mb-1.5 flex cursor-pointer items-center gap-1.5 text-[11.5px] text-muted-foreground">
+            <input
+              type="checkbox"
+              checked={legal}
+              onChange={(e) => setLegal(e.target.checked)}
+              disabled={running}
+              className="h-3.5 w-3.5"
+            />
+            {t("chat:legalMode")}
+          </label>
           <ChatInput
             kbId={kb}
             onKbChange={setKb}

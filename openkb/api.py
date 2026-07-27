@@ -45,7 +45,6 @@ from openkb.api_helpers import (
     _resolve_kb,
     _run_add_uploads,
     _save_query_answer,
-    _stream_add_uploads,
     _stream_chat,
     _stream_deck,
     _stream_query,
@@ -55,11 +54,13 @@ from openkb.api_helpers import (
     _stream_watch_events,
     _write_add_uploads,
     require_bearer_token,
+    zip_directory_bytes,
 )
+from openkb.api_ingest import start_add_job
+from openkb.api_jobs_router import jobs_router
 from openkb.api_kbs import _list_knowledge_bases
 from openkb.api_kbs_router import kbs_router
 from openkb.api_models import (
-    AddResponse,
     ChatRequest,
     ChatResponse,
     ChatSessionDeleteRequest,
@@ -110,6 +111,7 @@ from openkb.config import (
     resolve_init_kb_dir,
     validate_kb_name,
 )
+from openkb.jobs import JobRegistry
 from openkb.log import append_log
 from openkb.watch_service import WatchRegistry
 
@@ -126,21 +128,19 @@ def create_app() -> FastAPI:
     load_dotenv()
 
     registry = WatchRegistry()
+    # Server-owned background jobs: survive page refreshes; listed/re-attached/
+    # cancelled via the /api/v1/jobs endpoints.
+    app_jobs = JobRegistry()
 
-    # Per-KB asyncio locks for async mutation endpoints (lint/recompile).
-    # kb_ingest_lock tracks reentrancy in threading.local, but the event loop
-    # runs all requests on one thread, so concurrent same-KB mutations are
-    # mis-counted as re-entrant and bypass mutual exclusion. An asyncio.Lock
-    # serializes same-KB mutations *before* they enter the threading lock,
-    # eliminating the hazard without touching locks.py.
-    kb_mutation_locks: dict[str, asyncio.Lock] = {}
+    # Per-KB asyncio locks, two namespaces: `mutation` guards FAST read-modify-
+    # write steps only (upload reservation, config patch); `generation`
+    # serializes deck/skill output_dir writes. Long wiki mutations serialize on
+    # the portalocker ingest lock OFF the event loop (jobs.py / async_locks.py)
+    # — holding one here used to queue unrelated UI ops behind a long compile.
+    _lock_sets: dict[str, dict[str, asyncio.Lock]] = {"mutation": {}, "generation": {}}
 
-    def _kb_mutation_lock(kb: str) -> asyncio.Lock:
-        lock = kb_mutation_locks.get(kb)
-        if lock is None:
-            lock = asyncio.Lock()
-            kb_mutation_locks[kb] = lock
-        return lock
+    def _kb_lock(kind: str, kb: str) -> asyncio.Lock:
+        return _lock_sets[kind].setdefault(kb, asyncio.Lock())
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -161,20 +161,30 @@ def create_app() -> FastAPI:
             registry.stop_all()
 
     app = FastAPI(title="OpenKB API", lifespan=lifespan)
+    app.state.jobs_registry = app_jobs
 
     _configure_cors(app)
+    app.include_router(jobs_router)
     app.include_router(graph_router)
     app.include_router(output_router)
     app.include_router(config_router)
     app.include_router(kbs_router)
     app.include_router(pages_router)
     app.include_router(documents_router)
+    # Legal-KB overlay routers (graph + lifecycle, sync, visual) - UI §7.
+    from openkb.legal.api_legal_router import legal_router
+    from openkb.sync.api_sync_router import sync_router
+    from openkb.visual.api_visual_router import visual_router
+
+    app.include_router(legal_router)
+    app.include_router(sync_router)
+    app.include_router(visual_router)
 
     @app.get("/api/v1/kbs", response_model=KbListResponse)
     async def list_kbs_endpoint(
         _: None = Depends(require_bearer_token),
     ) -> KbListResponse:
-        return KbListResponse(**_list_knowledge_bases())
+        return KbListResponse(**await run_in_threadpool(_list_knowledge_bases))
 
     @app.get("/api/v1/meta", response_model=MetaResponse)
     async def meta_endpoint(
@@ -189,7 +199,7 @@ def create_app() -> FastAPI:
         kb: str = Query(...),
         _: None = Depends(require_bearer_token),
     ) -> KbConfigResponse:
-        return read_kb_config(_resolve_kb(kb))
+        return await run_in_threadpool(read_kb_config, _resolve_kb(kb))
 
     @app.patch("/api/v1/kb/config", response_model=KbConfigResponse)
     async def kb_config_patch_endpoint(
@@ -199,9 +209,9 @@ def create_app() -> FastAPI:
         # The merge-PATCH is a read-modify-write over config.yaml + .env; hold
         # the per-KB mutation lock so two concurrent patches cannot drop fields.
         kb_dir = _resolve_kb(request.kb)
-        async with _kb_mutation_lock(request.kb):
-            apply_kb_config_patch(kb_dir, request)
-        return read_kb_config(kb_dir)
+        async with _kb_lock("mutation", request.kb):
+            await run_in_threadpool(apply_kb_config_patch, kb_dir, request)
+        return await run_in_threadpool(read_kb_config, kb_dir)
 
     @app.post("/api/v1/init", response_model=InitResponse)
     async def init_endpoint(
@@ -240,7 +250,7 @@ def create_app() -> FastAPI:
             message=str(result["message"]),
         )
 
-    @app.post("/api/v1/add", response_model=AddResponse)
+    @app.post("/api/v1/add")
     async def add_endpoint(
         kb: str = Form(...),
         stream: str = Form("true"),
@@ -254,18 +264,19 @@ def create_app() -> FastAPI:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="No files uploaded.",
             )
-        # Reserve unique raw paths under the lock so concurrent same-name
-        # uploads cannot race on _unique_raw_path and overwrite each other,
-        # then stream the bodies outside it so a large or slow upload does not
-        # block other same-KB mutations (lint/recompile/other adds).
-        async with _kb_mutation_lock(kb):
+        # Reserve unique raw paths under a FAST lock (race-free name uniquing),
+        # then stream the bodies outside it so a large upload never blocks
+        # other same-KB operations.
+        async with _kb_lock("mutation", kb):
             reserved = _reserve_add_uploads(resolved_kb_dir, files)
         saved_uploads = await _write_add_uploads(reserved, files)
         if _parse_stream_form(stream):
-            return StreamingResponse(
-                _stream_add_uploads(kb, resolved_kb_dir, saved_uploads, bundle=bundle),
-                media_type="text/event-stream",
-            )
+            # Server-owned job: respond with the job id; the UI tails
+            # /api/v1/jobs/{id}/events (re-attachable; explicit cancel
+            # endpoint) so the compile outlives the HTTP connection.
+            job = start_add_job(app_jobs, kb, resolved_kb_dir, saved_uploads, bundle=bundle)
+            return {"job_id": job.id, "kb": kb, "status": job.status}
+        # Legacy synchronous path (scripts/tests): blocks until compiled.
         return await _run_add_uploads(kb, resolved_kb_dir, saved_uploads, bundle=bundle)
 
     @app.post("/api/v1/query", response_model=QueryResponse)
@@ -329,7 +340,7 @@ def create_app() -> FastAPI:
         try:
             answer = ""
             append_log(kb_dir / "wiki", "query", request.message)
-            agent = build_chat_session_agent(kb_dir, session, bundle=bundle)
+            agent = build_chat_session_agent(kb_dir, session, bundle=bundle, legal=request.legal)
             async for event in iter_chat_turn_events(
                 agent, session, request.message, run_config=run_config
             ):
@@ -353,7 +364,7 @@ def create_app() -> FastAPI:
     ) -> ChatSessionListResponse:
         kb_dir = _resolve_kb(request.kb)
         try:
-            sessions = list_sessions(kb_dir)
+            sessions = await run_in_threadpool(list_sessions, kb_dir)
         except Exception as exc:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -368,7 +379,7 @@ def create_app() -> FastAPI:
     ) -> ChatSessionLoadResponse:
         kb_dir = _resolve_kb(request.kb)
         try:
-            session = load_session(kb_dir, request.session_id)
+            session = await run_in_threadpool(load_session, kb_dir, request.session_id)
         except FileNotFoundError as exc:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -395,7 +406,7 @@ def create_app() -> FastAPI:
     ) -> ChatSessionDeleteResponse:
         kb_dir = _resolve_kb(request.kb)
         try:
-            deleted = delete_session(kb_dir, request.session_id)
+            deleted = await run_in_threadpool(delete_session, kb_dir, request.session_id)
         except Exception as exc:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -415,7 +426,7 @@ def create_app() -> FastAPI:
     ) -> ListResponse:
         kb_dir = _resolve_kb(request.kb)
         try:
-            return ListResponse(**get_kb_list(kb_dir))
+            return ListResponse(**await run_in_threadpool(get_kb_list, kb_dir))
         except Exception as exc:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -429,7 +440,7 @@ def create_app() -> FastAPI:
     ) -> StatusResponse:
         kb_dir = _resolve_kb(request.kb)
         try:
-            return StatusResponse(**get_kb_status(kb_dir))
+            return StatusResponse(**await run_in_threadpool(get_kb_status, kb_dir))
         except Exception as exc:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -444,12 +455,8 @@ def create_app() -> FastAPI:
         kb_dir = _resolve_kb(request.kb)
         bundle = resolve_credential_bundle(kb_dir)
         try:
-            # Only fix=True mutations need serialization; read-only lint
-            # (fix=False) is a report and may run concurrently.
-            if request.fix:
-                async with _kb_mutation_lock(request.kb):
-                    return LintResponse(**await run_lint_report(kb_dir, fix=True, bundle=bundle))
-            return LintResponse(**await run_lint_report(kb_dir, fix=False, bundle=bundle))
+            # fix=True takes the ingest lock INSIDE run_lint_report (off-loop).
+            return LintResponse(**await run_lint_report(kb_dir, fix=request.fix, bundle=bundle))
         except Exception as exc:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -499,36 +506,35 @@ def create_app() -> FastAPI:
         kb_dir = _resolve_kb(request.kb)
         bundle = resolve_credential_bundle(kb_dir)
         if request.stream:
-            lock = _kb_mutation_lock(request.kb)
             return StreamingResponse(
-                _stream_recompile(request, kb_dir, lock, fastapi_request, bundle=bundle),
+                _stream_recompile(request, kb_dir, fastapi_request, bundle=bundle),
                 media_type="text/event-stream",
             )
         # Aggregate the async generator into a single JSON response. Terminal
         # errors map to HTTP codes; the final event carries the aggregate.
+        # (Locking happens inside iter_recompile, off-loop — no pre-lock here.)
         targets: list[dict] | None = None
         candidates: list[dict[str, str]] | None = None
         error_code: int | None = None
         error_message: str | None = None
         result: dict = {}
-        async with _kb_mutation_lock(request.kb):
-            async for event in iter_recompile(
-                kb_dir,
-                request.doc_name,
-                all_docs=request.all_docs,
-                dry_run=request.dry_run,
-                refresh_schema=request.refresh_schema,
-                bundle=bundle,
-            ):
-                name = event.get("event")
-                if name == "plan":
-                    targets = event.get("targets", [])
-                elif name == "error":
-                    error_code = event.get("code", 500)
-                    error_message = event.get("message", "Recompile failed.")
-                    candidates = event.get("candidates")
-                elif name == "final":
-                    result = event
+        async for event in iter_recompile(
+            kb_dir,
+            request.doc_name,
+            all_docs=request.all_docs,
+            dry_run=request.dry_run,
+            refresh_schema=request.refresh_schema,
+            bundle=bundle,
+        ):
+            name = event.get("event")
+            if name == "plan":
+                targets = event.get("targets", [])
+            elif name == "error":
+                error_code = event.get("code", 500)
+                error_message = event.get("message", "Recompile failed.")
+                candidates = event.get("candidates")
+            elif name == "final":
+                result = event
         if error_code is not None:
             if error_code == 409 and candidates is not None:
                 raise HTTPException(
@@ -608,7 +614,7 @@ def create_app() -> FastAPI:
         kb_dir = _resolve_kb(request.kb)
         bundle = resolve_credential_bundle(kb_dir)
         if request.stream:
-            lock = _kb_mutation_lock(request.kb)
+            lock = _kb_lock("generation", request.kb)
             return StreamingResponse(
                 _stream_deck(request, kb_dir, lock, fastapi_request, bundle=bundle),
                 media_type="text/event-stream",
@@ -616,7 +622,7 @@ def create_app() -> FastAPI:
         error_code: int | None = None
         error_message: str | None = None
         result: dict = {}
-        async with _kb_mutation_lock(request.kb):
+        async with _kb_lock("generation", request.kb):
             async for event in _iter_deck(request, kb_dir, bundle=bundle):
                 name = event.get("event")
                 if name == "error":
@@ -636,14 +642,20 @@ def create_app() -> FastAPI:
         from openkb.deck import decks_root
 
         kb_dir = _resolve_kb(kb)
-        root = decks_root(kb_dir)
-        decks = (
-            sorted(
-                p.name for p in root.iterdir() if p.is_dir() and not p.name.endswith("-workspace")
+
+        def _list_decks() -> list[str]:
+            root = decks_root(kb_dir)
+            return (
+                sorted(
+                    p.name
+                    for p in root.iterdir()
+                    if p.is_dir() and not p.name.endswith("-workspace")
+                )
+                if root.is_dir()
+                else []
             )
-            if root.is_dir()
-            else []
-        )
+
+        decks = await run_in_threadpool(_list_decks)
         return DeckListResponse(decks=[{"name": n} for n in decks])
 
     @app.get("/api/v1/deck/{name}")
@@ -676,7 +688,7 @@ def create_app() -> FastAPI:
         kb_dir = _resolve_kb(request.kb)
         bundle = resolve_credential_bundle(kb_dir)
         if request.stream:
-            lock = _kb_mutation_lock(request.kb)
+            lock = _kb_lock("generation", request.kb)
             return StreamingResponse(
                 _stream_skill(request, kb_dir, lock, fastapi_request, bundle=bundle),
                 media_type="text/event-stream",
@@ -684,7 +696,7 @@ def create_app() -> FastAPI:
         error_code: int | None = None
         error_message: str | None = None
         result: dict = {}
-        async with _kb_mutation_lock(request.kb):
+        async with _kb_lock("generation", request.kb):
             async for event in _iter_skill(request, kb_dir, bundle=bundle):
                 name = event.get("event")
                 if name == "error":
@@ -704,14 +716,20 @@ def create_app() -> FastAPI:
         from openkb.skill import skills_root
 
         kb_dir = _resolve_kb(kb)
-        root = skills_root(kb_dir)
-        skills = (
-            sorted(
-                p.name for p in root.iterdir() if p.is_dir() and not p.name.endswith("-workspace")
+
+        def _list_skills() -> list[str]:
+            root = skills_root(kb_dir)
+            return (
+                sorted(
+                    p.name
+                    for p in root.iterdir()
+                    if p.is_dir() and not p.name.endswith("-workspace")
+                )
+                if root.is_dir()
+                else []
             )
-            if root.is_dir()
-            else []
-        )
+
+        skills = await run_in_threadpool(_list_skills)
         return SkillListResponse(skills=[{"name": n} for n in skills])
 
     @app.get("/api/v1/skill/{name}/archive")
@@ -721,7 +739,6 @@ def create_app() -> FastAPI:
         _: None = Depends(require_bearer_token),
     ) -> Any:
         import io
-        import zipfile
 
         from openkb.cli import _validate_skill_name
         from openkb.skill import skill_dir, skills_root
@@ -735,13 +752,9 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="Invalid skill name.")
         if not target.is_dir():
             raise HTTPException(status_code=404, detail=f"Skill not found: {name}")
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for f in target.rglob("*"):
-                if f.is_file():
-                    zf.write(f, f.relative_to(target))
-        buf.seek(0)
-        return StreamingResponse(buf, media_type="application/zip")
+        # Zip off-loop: reading+deflating every file is CPU/FS work.
+        archive = await run_in_threadpool(zip_directory_bytes, target)
+        return StreamingResponse(io.BytesIO(archive), media_type="application/zip")
 
     # Catch-all for unknown API paths so they return JSON 404 instead of being
     # swallowed by the StaticFiles mount below (which serves index.html for SPA
