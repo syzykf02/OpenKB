@@ -997,7 +997,11 @@ function DocumentReaderDrawer({
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
               transition={reduce ? { duration: 0.12 } : { duration: 0.2 }}
-              onClick={onClose}
+              onClick={(e) => {
+                // Only close on the backdrop itself; clicks that originate in
+                // the content must not dismiss the drawer.
+                if (e.target === e.currentTarget) onClose()
+              }}
             />
             <Dialog.Content
               asChild
@@ -1024,6 +1028,7 @@ function DocumentReaderDrawer({
                 animate={reduce ? { opacity: 1 } : { opacity: 1, x: 0 }}
                 exit={reduce ? { opacity: 0 } : { opacity: 0, x: 24 }}
                 transition={reduce ? { duration: 0.12 } : { type: 'spring', bounce: 0, duration: 0.3 }}
+                onClick={(e) => e.stopPropagation()}
               >
                 <div className="flex shrink-0 items-center gap-3 border-b border-[hsl(var(--glass-border))] px-5 py-3">
                   <span className="grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-[hsl(var(--glass-border))] bg-muted">
