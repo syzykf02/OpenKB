@@ -38,7 +38,8 @@
       "skipped": "Skipped",
       "exists": "Already in KB",
       "failed": "Failed",
-      "cancelled": "Cancelled"
+      "cancelled": "Cancelled",
+      "interrupted": "Interrupted by restart"
     }
   },
   "jobs": {

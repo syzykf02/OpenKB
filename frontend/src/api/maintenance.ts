@@ -100,13 +100,40 @@ export interface JobSummary {
   kind: string
   kb: string
   title: string
-  status: "queued" | "running" | "done" | "failed" | "cancelled"
+  status: "queued" | "running" | "done" | "failed" | "cancelled" | "interrupted"
   created_at: number
   started_at: number | null
   finished_at: number | null
   result: AddResult | null
   error: string | null
   last_seq: number
+}
+
+/** Persistent file-first compilation state from `.openkb/file-tasks.json`. */
+export interface FileTask {
+  id: string
+  name: string
+  raw_path: string | null
+  source_hash: string | null
+  document_name: string | null
+  status: "queued" | "running" | "pending" | "succeeded" | "skipped" | "failed" | "cancelled" | "interrupted" | "deleted"
+  step: string
+  completed_steps: number
+  total_steps: number
+  message: string | null
+  error: string | null
+  created_at: number
+  updated_at: number
+  last_job_id: string | null
+  actions: Array<"cancel" | "compile" | "delete">
+  history: Array<{
+    job_id: string
+    kind: string
+    status: string
+    created_at: number
+    updated_at?: number
+    logs: Array<{ at: number; level: string; message: string }>
+  }>
 }
 
 /**
@@ -147,6 +174,20 @@ export function listJobs(kb: string): Promise<JobSummary[]> {
   return apiFetch<{ jobs: JobSummary[] }>(`/api/v1/jobs?kb=${encodeURIComponent(kb)}`).then(
     (r) => r.jobs,
   )
+}
+
+export function listFileTasks(kb: string, includeDeleted = false): Promise<FileTask[]> {
+  const query = new URLSearchParams({ kb })
+  if (includeDeleted) query.set("include_deleted", "true")
+  return apiFetch<{ files: FileTask[] }>(`/api/v1/file-tasks?${query}`).then((r) => r.files)
+}
+
+export function compileFileTask(kb: string, fileId: string): Promise<{ job_id: string; file_id: string; status: string }> {
+  return apiFetch(`/api/v1/file-tasks/${fileId}/compile`, { body: { kb } })
+}
+
+export function deleteFileTask(kb: string, fileId: string): Promise<{ status: string; file_id: string; name: string }> {
+  return apiFetch(`/api/v1/file-tasks/${fileId}`, { method: "DELETE", body: { kb } })
 }
 
 /**

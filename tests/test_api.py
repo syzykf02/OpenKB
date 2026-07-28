@@ -3733,3 +3733,47 @@ def test_add_job_cancel_endpoint_stops_batch(monkeypatch, kb_dir):
         assert cancelled_files[0]["data"]["original_name"] == "one.md"
         assert "cancelled" in names and "final" not in names
         assert names[-1] == "done"
+
+
+def test_file_task_api_persists_compile_state_and_deleted_history(monkeypatch, kb_dir):
+    """The file-first API survives polling independently from the SSE ring."""
+    client = _client(monkeypatch)
+    kb = _use_named_kb(monkeypatch, kb_dir)
+    raw = kb_dir / "raw" / "queued.md"
+    raw.write_text("# queued", encoding="utf-8")
+
+    from openkb.cli import AddFileResult
+
+    def fake_add(path, target_kb, **kwargs):
+        return AddFileResult(path.name, str(path), "added", "added")
+
+    monkeypatch.setattr("openkb.api_helpers._add_for_api", fake_add)
+
+    with client:
+        listed = client.get(f"/api/v1/file-tasks?kb={kb}", headers=_auth())
+        assert listed.status_code == 200
+        task = next(item for item in listed.json()["files"] if item["name"] == "queued.md")
+        assert task["status"] == "pending"
+
+        accepted = client.post(
+            f"/api/v1/file-tasks/{task['id']}/compile",
+            json={"kb": kb},
+            headers=_auth(),
+        )
+        assert accepted.status_code == 200
+        assert _wait_for_job(client, accepted.json()["job_id"])["status"] == "done"
+
+        compiled = client.get(f"/api/v1/file-tasks?kb={kb}", headers=_auth()).json()["files"]
+        assert next(item for item in compiled if item["id"] == task["id"])["status"] == "succeeded"
+
+        deleted = client.request(
+            "DELETE", f"/api/v1/file-tasks/{task['id']}", json={"kb": kb}, headers=_auth()
+        )
+        assert deleted.status_code == 200
+        assert not raw.exists()
+        visible = client.get(f"/api/v1/file-tasks?kb={kb}", headers=_auth()).json()["files"]
+        assert all(item["id"] != task["id"] for item in visible)
+        history = client.get(
+            f"/api/v1/file-tasks?kb={kb}&include_deleted=true", headers=_auth()
+        ).json()["files"]
+        assert next(item for item in history if item["id"] == task["id"])["status"] == "deleted"

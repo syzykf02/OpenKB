@@ -27,6 +27,7 @@ function UploadStatusIcon({ status }: { status: UploadStatus }) {
     case 'exists':
       return <CircleSlash2 className="h-4 w-4 text-muted-foreground" />
     case 'failed':
+    case 'interrupted':
       return <XCircle className="h-4 w-4 text-red-500 dark:text-red-400" />
     case 'cancelled':
       return <Ban className="h-4 w-4 text-amber-500 dark:text-amber-400" />
@@ -40,7 +41,7 @@ function FileStatus({ file }: { file: UploadFileState }) {
   const total = Math.max(file.totalSteps, 1)
   const completed = Math.min(file.completedSteps, total)
   return (
-    <div className="min-w-[82px] text-right">
+    <div className="w-[112px] shrink-0 text-right">
       <div className="text-[10.5px] font-medium text-muted-foreground">{t(`upload.fileStatus.${file.status}`)}</div>
       <div className="mt-1 flex items-center justify-end gap-1.5">
         <div className="h-1 w-10 overflow-hidden rounded-full bg-muted">
@@ -71,6 +72,7 @@ export interface JobsPanelProps {
   onCancelFile: (file: CompileTaskFile) => void
   onRetryFile: (file: CompileTaskFile) => void
   onCompilePendingFile: (document: PendingDocument) => void
+  onDeleteFile: (file: CompileTaskFile) => void
   onPreviewDocument: (document: WikiDocument) => void
   recompilingDocumentNames: ReadonlySet<string>
   onRecompileDocument: (document: WikiDocument) => void
@@ -90,6 +92,7 @@ export default function JobsPanel({
   onCancelFile,
   onRetryFile,
   onCompilePendingFile,
+  onDeleteFile,
   onPreviewDocument,
   recompilingDocumentNames,
   onRecompileDocument,
@@ -103,72 +106,24 @@ export default function JobsPanel({
   const documentsByHash = new Map(documents.map((document) => [document.hash, document]))
   const pendingByPath = new Map(pendingDocuments.map((document) => [document.path, document]))
   const pendingByName = new Map(pendingDocuments.map((document) => [document.name, document]))
-  // Jobs are newest-first. Keep only the latest state for a filename so a
-  // failed attempt followed by a retry does not create multiple source rows.
-  const latestTaskFiles = taskFiles.filter(
-    (file, index, all) => all.findIndex((candidate) => candidate.name === file.name) === index,
-  )
-  const representedNames = new Set(
-    latestTaskFiles
-      .filter((file) => file.status === 'added' || file.status === 'exists')
-      .map((file) => file.name),
-  )
-  const representedHashes = new Set(
-    latestTaskFiles
-      .filter((file) => file.status === 'added' || file.status === 'exists')
-      .map((file) => file.sourceHash)
-      .filter((hash): hash is string => !!hash),
-  )
-  const completedFiles: CompileTaskFile[] = documents
-    .filter((document) => !representedNames.has(document.name) && !representedHashes.has(document.hash))
-    .map((document) => ({
-      id: `document:${document.hash || document.name}`,
-      name: document.name,
-      sourceHash: document.hash,
-      status: 'added',
-      message: document.display_type,
-      uploadIndex: null,
-      completedSteps: 4,
-      totalSteps: 4,
-      step: 'finalize',
-      jobId: '',
-      jobStatus: 'done',
-      createdAt: 0,
-    }))
-  // A successful task already represents its source. Once that source has
-  // been removed, omit its historical success row as well: this surface is a
-  // source inventory, not a permanent audit log. Failed/cancelled work stays
-  // visible so it can be retried or explained by the live log.
-  const sourceTasks = latestTaskFiles.filter(
-    (file) => file.status !== 'added' || documentsByName.has(file.name),
-  )
-  const activePendingPaths = new Set(
-    sourceTasks
-      .filter((file) => file.sourcePath && file.jobId)
-      .map((file) => file.sourcePath),
-  )
-  const pendingFiles: CompileTaskFile[] = pendingDocuments
-    .filter(
-      (document) =>
-        !documentsByName.has(document.name) &&
-        !activePendingPaths.has(document.path) &&
-        !sourceTasks.some((file) => file.name === document.name),
-    )
-    .map((document) => ({
-      id: `pending:${document.path}`,
-      name: document.name,
-      sourcePath: document.path,
-      status: 'uploaded',
-      message: document.display_type,
-      uploadIndex: null,
-      completedSteps: 1,
-      totalSteps: 4,
-      step: 'prepare',
-      jobId: '',
-      jobStatus: 'done',
-      createdAt: 0,
-    }))
-  const files = [...sourceTasks, ...completedFiles, ...pendingFiles]
+  // Persisted file-task rows are the source of truth. `documents` only adds
+  // reader affordances, and pending rows remain a compatibility fallback for
+  // sources uploaded before the task-state file existed.
+  const legacyPendingFiles: CompileTaskFile[] = pendingDocuments.map((document) => ({
+        id: `pending:${document.path}`,
+        name: document.name,
+        sourcePath: document.path,
+        status: 'uploaded' as UploadStatus,
+        message: document.display_type,
+        uploadIndex: null,
+        completedSteps: 1,
+        totalSteps: 4,
+        step: 'prepare',
+        jobId: '',
+        jobStatus: 'done' as const,
+        createdAt: 0,
+      }))
+  const files: CompileTaskFile[] = taskFiles.length > 0 ? taskFiles : legacyPendingFiles
 
   useEffect(() => {
     const element = logRef.current
@@ -201,13 +156,18 @@ export default function JobsPanel({
                       : pendingByName.get(file.name)
                     const recompiling = !!document && recompilingDocumentNames.has(document.name)
                     const activeJob =
-                      !!file.jobId && (file.jobStatus === 'queued' || file.jobStatus === 'running')
+                      file.persistentStatus === 'queued' || file.persistentStatus === 'running' ||
+                      (!!file.jobId && (file.jobStatus === 'queued' || file.jobStatus === 'running'))
+                    const canCompile = !!file.actions?.includes('compile')
+                    const canDelete = !!file.actions?.includes('delete')
+                    const canDeleteDocument = !activeJob && !canDelete && !!document
+                    const canDeletePending = !activeJob && !canDelete && !document && !!pendingDocument
                     const displayFile = recompiling
                       ? { ...file, status: 'processing' as UploadStatus, completedSteps: 2, totalSteps: 4, step: 'compile' }
                       : file
                     return (
-                      <div key={file.id} className="group flex items-center gap-2 border-b border-[hsl(var(--glass-border))] py-2.5 last:border-b-0">
-                        <div className="flex min-w-0 flex-1 items-center gap-2.5">
+                      <div key={file.id} className="group grid grid-cols-[minmax(0,1fr)_112px_auto] items-center gap-x-3 border-b border-[hsl(var(--glass-border))] py-2.5 last:border-b-0">
+                        <div className="flex min-w-0 items-center gap-2.5">
                           <UploadStatusIcon status={displayFile.status} />
                           <span className="min-w-0 flex-1">
                             {document ? (
@@ -224,10 +184,10 @@ export default function JobsPanel({
                             )}
                             <span className="mt-0.5 block truncate text-[10.5px] text-muted-foreground">{recompiling ? t('jobs.steps.compile') : file.message || t(`jobs.steps.${file.step}`)}</span>
                           </span>
-                          <FileStatus file={displayFile} />
                         </div>
-                        <div className="flex shrink-0 items-center gap-1">
-                          {!activeJob && file.status === 'failed' && file.uploadIndex != null && file.jobId ? (
+                        <FileStatus file={displayFile} />
+                        <div className="flex min-w-[112px] shrink-0 items-center justify-end gap-1">
+                          {!activeJob && canCompile ? (
                             <button
                               type="button"
                               onClick={() => onRetryFile(file)}
@@ -256,7 +216,17 @@ export default function JobsPanel({
                               {t('upload.compile')}
                             </button>
                           ) : null}
-                          {document && (
+                          {canDelete ? (
+                            <button
+                              type="button"
+                              onClick={() => onDeleteFile(file)}
+                              title={t('docs.delete.action')}
+                              aria-label={t('docs.delete.action')}
+                              className="grid h-7 w-7 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-500/10 dark:hover:text-red-400"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          ) : canDeleteDocument && document ? (
                             <button
                               type="button"
                               onClick={() => onRequestDeleteDocument(document)}
@@ -267,8 +237,7 @@ export default function JobsPanel({
                             >
                               {deletingDocumentName === document.name ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
                             </button>
-                          )}
-                          {!activeJob && !document && pendingDocument && (
+                          ) : canDeletePending && pendingDocument ? (
                             <button
                               type="button"
                               onClick={() => onRequestDeletePending(pendingDocument)}
@@ -279,7 +248,7 @@ export default function JobsPanel({
                             >
                               {deletingDocumentName === pendingDocument.name ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
                             </button>
-                          )}
+                          ) : null}
                           {activeJob && (
                             <button
                               type="button"

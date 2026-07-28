@@ -4,12 +4,16 @@ import type { TFunction } from 'i18next'
 import { toast } from 'sonner'
 import {
   cancelJob,
+  compileFileTask,
   compilePendingDocument,
+  deleteFileTask,
+  listFileTasks,
   listJobs,
   retryJobFile,
   startUpload,
   streamJobEvents,
   type AddResult,
+  type FileTask,
   type JobSummary,
   type UploadEvent,
 } from '@/api/maintenance'
@@ -32,6 +36,7 @@ export type UploadStatus =
   | 'exists'
   | 'failed'
   | 'cancelled'
+  | 'interrupted'
 
 export interface UploadFileState {
   /** Stable generated id, assigned once at seed time - the React key. Rows are
@@ -70,6 +75,10 @@ export interface CompileTaskFile extends UploadFileState {
   jobId: string
   jobStatus: JobSummary['status']
   createdAt: number
+  /** Persisted rows are restored from `.openkb/file-tasks.json`, not SSE. */
+  persistent?: boolean
+  actions?: ReadonlyArray<'cancel' | 'compile' | 'delete'>
+  persistentStatus?: FileTask['status']
 }
 
 interface JobData {
@@ -77,7 +86,7 @@ interface JobData {
   logs: UploadLogLine[]
 }
 
-const TERMINAL = new Set<JobSummary['status']>(['done', 'failed', 'cancelled'])
+const TERMINAL = new Set<JobSummary['status']>(['done', 'failed', 'cancelled', 'interrupted'])
 const isTerminal = (j: JobSummary) => TERMINAL.has(j.status)
 
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e))
@@ -174,6 +183,8 @@ export interface UseJobsResult {
   /** Start compilation for a source that was uploaded previously and is still
    * present in the KB's raw directory. */
   compilePendingFile: (document: PendingDocument) => void
+  /** Permanently remove the source/artifacts and retain a deleted history row. */
+  deleteFile: (file: CompileTaskFile) => void
 }
 
 /**
@@ -197,6 +208,7 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
   const { t } = useTranslation(['kb', 'common'])
 
   const [serverJobs, setServerJobs] = useState<JobSummary[]>([])
+  const [fileTasks, setFileTasks] = useState<FileTask[]>([])
   const [jobData, setJobData] = useState<Record<string, JobData>>({})
   // Files deduped in the browser never create a server job, but still belong
   // in the visible task list so the user can see why they were not uploaded.
@@ -228,6 +240,10 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
   const prevStatusRef = useRef<Record<string, JobSummary['status']>>({})
   // Monotonic counter for per-row React keys.
   const rowIdSeq = useRef(0)
+
+  const refreshFileTasks = useCallback(() => {
+    return listFileTasks(kb).then(setFileTasks).catch(() => {})
+  }, [kb])
 
   /** Fold one add-job SSE event into the job's rows + log panel. Shared by live
    *  attaches and post-refresh re-attach (which replays history, so the same
@@ -441,6 +457,7 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
     setJobData({})
     setClientOnlyFiles([])
     setServerJobs([])
+    setFileTasks([])
     setSelectedJobId(null)
     setCancellingJobIds(new Set())
     notifyJobIdRef.current = null
@@ -451,14 +468,17 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
         if (stale) return
         setServerJobs(jobs)
         for (const j of jobs) prevStatusRef.current[j.id] = j.status
-        const latest = [...jobs].reverse().find((j) => j.kind === 'add')
+        // A restarted server restores task history from JSON but cannot replay
+        // the old in-memory SSE ring. Attach only to a live job.
+        const latest = [...jobs].reverse().find((j) => j.kind === 'add' && !isTerminal(j))
         if (latest) selectJob(latest.id)
       })
       .catch(() => {})
+    void refreshFileTasks()
     return () => {
       stale = true
     }
-  }, [kb, selectJob])
+  }, [kb, refreshFileTasks, selectJob])
 
   // Poll while any job is active: refreshes status badges and detects
   // completions for jobs whose SSE view was switched away (the toast + inventory
@@ -484,10 +504,11 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
           })
         })
         .catch(() => {})
+      void refreshFileTasks()
     }
     const h = setInterval(tick, 1500)
     return () => clearInterval(h)
-  }, [hasActive, kb, maybeComplete])
+  }, [hasActive, kb, maybeComplete, refreshFileTasks])
 
   // Attach the selected job's SSE stream. Switching selection (or unmount)
   // aborts the previous view; the new selection re-attaches from the ring.
@@ -560,6 +581,7 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
         return
       }
       const jobId = accepted.job_id
+      void refreshFileTasks()
       const first = toUpload[0]?.name ?? '?'
       const title =
         `add: ${first}` + (toUpload.length > 1 ? ` (+${toUpload.length - 1})` : '')
@@ -587,7 +609,7 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
       notifiedRef.current.delete(jobId)
       selectJob(jobId)
     },
-    [kb, selectJob],
+    [kb, refreshFileTasks, selectJob],
   )
 
   const cancelFile = useCallback((file: CompileTaskFile) => {
@@ -608,6 +630,34 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
 
   const retryFile = useCallback(
     async (file: CompileTaskFile) => {
+      if (file.persistent) {
+        try {
+          const accepted = await compileFileTask(kb, file.id)
+          setServerJobs((prev) => [
+            ...prev,
+            {
+              id: accepted.job_id,
+              kind: 'recompile',
+              kb,
+              title: `compile: ${file.name}`,
+              status: 'queued',
+              created_at: Date.now() / 1000,
+              started_at: null,
+              finished_at: null,
+              result: null,
+              error: null,
+              last_seq: -1,
+            },
+          ])
+          prevStatusRef.current[accepted.job_id] = 'queued'
+          notifyJobIdRef.current = accepted.job_id
+          notifiedRef.current.delete(accepted.job_id)
+          void refreshFileTasks()
+        } catch (e) {
+          toast.error(errMsg(e))
+        }
+        return
+      }
       const sourceJobId = file.jobId
       if (file.status !== 'failed' || file.uploadIndex == null) return
       let accepted: { job_id: string; status: string }
@@ -649,7 +699,7 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
       notifiedRef.current.delete(jobId)
       selectJob(jobId)
     },
-    [kb, selectJob],
+    [kb, refreshFileTasks, selectJob],
   )
 
   const compilePendingFile = useCallback(
@@ -698,33 +748,48 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
   )
 
   const taskFiles = useMemo(() => {
-    const files: CompileTaskFile[] = [...clientOnlyFiles]
-    for (const job of serverJobs) {
-      if (job.kind !== 'add') continue
-      const streamed = jobData[job.id]?.files
-      const source = streamed?.length
-        ? streamed
-        : (job.result?.files ?? []).map((file, index) => ({
-            id: `${job.id}:${index}`,
-            name: file.original_name,
-            status: file.status as UploadStatus,
-            message: file.message,
-            uploadIndex: index,
-            completedSteps: file.status === 'added' || file.status === 'skipped' ? 4 : 2,
-            totalSteps: 4,
-            step: file.status === 'added' || file.status === 'skipped' ? 'finalize' : 'compile',
-          }))
-      files.push(
-        ...source.map((file) => ({
-          ...file,
-          jobId: job.id,
-          jobStatus: job.status,
-          createdAt: job.created_at,
-        })),
-      )
+    const statusMap: Record<FileTask['status'], UploadStatus> = {
+      queued: 'pending',
+      running: 'processing',
+      pending: 'uploaded',
+      succeeded: 'added',
+      skipped: 'skipped',
+      failed: 'failed',
+      cancelled: 'cancelled',
+      interrupted: 'interrupted',
+      deleted: 'cancelled',
     }
-    return files.sort((a, b) => b.createdAt - a.createdAt)
-  }, [clientOnlyFiles, jobData, serverJobs])
+    const persisted: CompileTaskFile[] = fileTasks.map((file) => ({
+      id: file.id,
+      name: file.name,
+      sourceHash: file.source_hash ?? undefined,
+      sourcePath: file.raw_path ?? undefined,
+      status: statusMap[file.status],
+      message: file.error || file.message || undefined,
+      uploadIndex: null,
+      completedSteps: file.completed_steps,
+      totalSteps: file.total_steps,
+      step: file.step,
+      jobId: file.last_job_id ?? '',
+      jobStatus: file.status === 'queued' ? 'queued' : file.status === 'running' ? 'running' : 'done',
+      createdAt: file.updated_at,
+      persistent: true,
+      actions: file.actions,
+      persistentStatus: file.status,
+    }))
+    return [...clientOnlyFiles, ...persisted].sort((a, b) => b.createdAt - a.createdAt)
+  }, [clientOnlyFiles, fileTasks])
+
+  const deleteFile = useCallback((file: CompileTaskFile) => {
+    if (!file.persistent) return
+    deleteFileTask(kb, file.id)
+      .then(() => {
+        toast.success(tRef.current('kb:docs.delete.success', { name: file.name }))
+        void refreshFileTasks()
+        onCompletedRef.current()
+      })
+      .catch((e) => toast.error(errMsg(e)))
+  }, [kb, refreshFileTasks])
 
   const selectedData = selectedJobId ? jobData[selectedJobId] : undefined
   return {
@@ -739,5 +804,6 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
     cancellingJobIds,
     retryFile,
     compilePendingFile,
+    deleteFile,
   }
 }

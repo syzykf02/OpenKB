@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import logging
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from openkb.indexer import (
     IndexResult,
+    _add_document_interruptibly,
     _build_index_config,
     _normalize_page_content,
     index_long_document,
@@ -196,6 +198,77 @@ class TestNormalizePageContent:
     def test_rejects_unusable_shapes(self):
         assert _normalize_page_content({"page": 1}) == []
         assert _normalize_page_content([None, {}, {"content": ""}]) == []
+
+
+def test_api_cancel_terminates_inflight_pageindex_process(tmp_path, monkeypatch):
+    """An API cancellation must stop PageIndex even while ``add`` is blocked."""
+    import openkb.indexer as indexer
+    from openkb.ingest_cancel import IngestCancelled, cancel_event_var
+
+    class FakeConnection:
+        def poll(self, _timeout):
+            return False  # PageIndex has not finished yet.
+
+        def close(self):
+            pass
+
+    class FakeProcess:
+        def __init__(self):
+            self.started = False
+            self.terminated = False
+            self.alive = True
+            self.exitcode = None
+
+        def start(self):
+            self.started = True
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            self.terminated = True
+            self.alive = False
+
+        def join(self, *_args):
+            pass
+
+    class FakeContext:
+        def __init__(self):
+            self.process = FakeProcess()
+
+        def Pipe(self, *, duplex):
+            assert duplex is False
+            return FakeConnection(), FakeConnection()
+
+        def Process(self, **_kwargs):
+            return self.process
+
+    context = FakeContext()
+    checks = 0
+
+    def cancel_on_second_check():
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            raise IngestCancelled("cancelled by test")
+
+    token = cancel_event_var.set(threading.Event())
+    monkeypatch.setattr(indexer.multiprocessing, "get_context", lambda _name: context)
+    monkeypatch.setattr(indexer, "check_cancelled", cancel_on_second_check)
+    try:
+        with pytest.raises(IngestCancelled, match="cancelled by test"):
+            _add_document_interruptibly(
+                tmp_path / "long.pdf",
+                api_key=None,
+                model="test-model",
+                storage_path=tmp_path,
+                index_config=_build_index_config({}),
+            )
+    finally:
+        cancel_event_var.reset(token)
+
+    assert context.process.started
+    assert context.process.terminated
 
 
 class TestIndexLongDocument:

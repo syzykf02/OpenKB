@@ -38,7 +38,8 @@
       "skipped": "已跳过",
       "exists": "已存在",
       "failed": "失败",
-      "cancelled": "已取消"
+      "cancelled": "已取消",
+      "interrupted": "服务重启中断"
     }
   },
   "jobs": {

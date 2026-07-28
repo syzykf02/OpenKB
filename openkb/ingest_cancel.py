@@ -3,8 +3,10 @@
 The REST API runs each ``add`` in a threadpool worker (``run_in_threadpool``),
 which threads cannot be killed — so cancellation is cooperative: the API layer
 sets a ``threading.Event`` and the pipeline checks it at LLM-call boundaries
-(``agent/compiler.py``), where essentially all wall time is spent. On a hit,
-``check_cancelled`` raises ``IngestCancelled``.
+(``agent/compiler.py``), where essentially all wall time is spent. PageIndex's
+blocking ``Collection.add()`` has no cancellation API, so API jobs run that
+single operation in a child process and stop the process when this flag is
+set. On a hit, ``check_cancelled`` raises ``IngestCancelled``.
 
 ``IngestCancelled`` deliberately subclasses ``BaseException`` (like
 ``KeyboardInterrupt``): the pipeline is full of ``except Exception`` handlers

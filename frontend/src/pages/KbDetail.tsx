@@ -362,6 +362,7 @@ export default function KbDetail() {
             onCancelFile={jobs.cancelFile}
             onRetryFile={jobs.retryFile}
             onCompilePendingFile={jobs.compilePendingFile}
+            onDeleteFile={jobs.deleteFile}
           />
         ) : section === 'legal-graph' ? (
           <LegalGraphView kb={id} />
@@ -768,6 +769,7 @@ function DocumentsPane({
   onCancelFile,
   onRetryFile,
   onCompilePendingFile,
+  onDeleteFile,
 }: {
   kb: string
   documents: WikiDocument[]
@@ -785,6 +787,7 @@ function DocumentsPane({
   onCancelFile: (file: CompileTaskFile) => void
   onRetryFile: (file: CompileTaskFile) => void
   onCompilePendingFile: (document: PendingDocument) => void
+  onDeleteFile: (file: CompileTaskFile) => void
 }) {
   const { t } = useTranslation(['kb', 'common'])
   const reduce = useReducedMotion()
@@ -922,6 +925,7 @@ function DocumentsPane({
                   onCancelFile={onCancelFile}
                   onRetryFile={onRetryFile}
                   onCompilePendingFile={onCompilePendingFile}
+                  onDeleteFile={onDeleteFile}
                   onPreviewDocument={setPreviewDocument}
                   recompilingDocumentNames={recompilingDocumentNames}
                   onRecompileDocument={recompileDocument}
@@ -1233,6 +1237,7 @@ function CompileJobsTab({
   onCancelFile,
   onRetryFile,
   onCompilePendingFile,
+  onDeleteFile,
   onPreviewDocument,
   recompilingDocumentNames,
   onRecompileDocument,
@@ -1253,6 +1258,7 @@ function CompileJobsTab({
   onCancelFile: (file: CompileTaskFile) => void
   onRetryFile: (file: CompileTaskFile) => void
   onCompilePendingFile: (document: PendingDocument) => void
+  onDeleteFile: (file: CompileTaskFile) => void
   onPreviewDocument: (document: WikiDocument) => void
   recompilingDocumentNames: ReadonlySet<string>
   onRecompileDocument: (document: WikiDocument) => void
@@ -1262,7 +1268,7 @@ function CompileJobsTab({
 }) {
   const { t } = useTranslation('kb')
   return (
-    <div className="grid gap-6 lg:grid-cols-[240px_minmax(0,1fr)]">
+    <div className="flex flex-col gap-8">
       <section>
         <div className="flex items-baseline justify-between gap-4">
           <div>
@@ -1301,7 +1307,7 @@ function CompileJobsTab({
         </div>
       </section>
 
-      <section className="min-w-0 border-t border-[hsl(var(--glass-border))] pt-5 lg:border-l lg:border-t-0 lg:pl-8 lg:pt-0">
+      <section className="min-w-0 border-t border-[hsl(var(--glass-border))] pt-6">
         <JobsPanel
           taskFiles={taskFiles}
           documents={documents}
@@ -1311,6 +1317,7 @@ function CompileJobsTab({
           onCancelFile={onCancelFile}
           onRetryFile={onRetryFile}
           onCompilePendingFile={onCompilePendingFile}
+          onDeleteFile={onDeleteFile}
           onPreviewDocument={onPreviewDocument}
           recompilingDocumentNames={recompilingDocumentNames}
           onRecompileDocument={onRecompileDocument}
