@@ -888,10 +888,12 @@ def test_list_endpoint_returns_empty_inventory(monkeypatch, kb_dir):
     assert response.status_code == 200
     assert response.json() == {
         "documents": [],
+        "pending_documents": [],
         "document_count": 0,
         "summaries": [],
         "concepts": [],
         "entities": [],
+        "entity_types": {},
         "reports": [],
     }
 
@@ -946,13 +948,18 @@ def test_list_endpoint_includes_entities(monkeypatch, kb_dir):
         json.dumps({"h1": {"name": "p.pdf", "type": "pdf"}}), encoding="utf-8"
     )
     (kb_dir / "wiki" / "entities").mkdir(parents=True, exist_ok=True)
-    (kb_dir / "wiki" / "entities" / "nvidia.md").write_text("# NVIDIA", encoding="utf-8")
+    (kb_dir / "wiki" / "entities" / "nvidia.md").write_text(
+        "---\ntype: Organization\n---\n# NVIDIA", encoding="utf-8"
+    )
     (kb_dir / "wiki" / "entities" / "anthropic.md").write_text("# Anthropic", encoding="utf-8")
 
     response = client.post("/api/v1/list", json={"kb": kb}, headers=_auth())
 
     assert response.status_code == 200
     assert response.json()["entities"] == ["anthropic", "nvidia"]
+    # entity_types maps each stem to its lowercased frontmatter `type`; a page
+    # with no frontmatter falls back to "other".
+    assert response.json()["entity_types"] == {"anthropic": "other", "nvidia": "organization"}
 
 
 def test_list_includes_uploaded_uncompiled_sources_and_can_resume_them(monkeypatch, kb_dir):

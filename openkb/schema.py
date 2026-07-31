@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from openkb import frontmatter
+
 # The compiled page-type subdirectories under wiki/. Shared source of truth
 # for surfaces that enumerate page content (list, lint, status, skill gate).
 PAGE_CONTENT_DIRS = ("summaries", "concepts", "entities")
@@ -61,6 +63,22 @@ Operations: ingest, query, lint
 
 # Backward compat alias
 SCHEMA_MD = AGENTS_MD
+
+
+def read_entity_types(entities_dir: Path) -> dict[str, str]:
+    """Map each entity page stem to its lowercase frontmatter ``type``.
+
+    Missing/malformed ``type`` falls back to ``"other"``, mirroring the
+    compiler's read of the same field. ``entities_dir`` may not exist.
+    """
+    result: dict[str, str] = {}
+    if not entities_dir.exists():
+        return result
+    for path in entities_dir.glob("*.md"):
+        fm = frontmatter.parse(path.read_text(encoding="utf-8"))
+        raw = fm.get("type")
+        result[path.stem] = str(raw).strip().lower() if isinstance(raw, str) and raw.strip() else "other"
+    return result
 
 
 def get_agents_md(wiki_dir: Path) -> str:

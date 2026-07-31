@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from openkb.locks import atomic_write_json, flock, funlock
+from openkb.state import HashRegistry
 
 STATE_VERSION = 1
 ACTIVE_FILE_STATUSES = frozenset({"queued", "running"})
@@ -48,6 +49,7 @@ class FileTaskStore:
         self._lock = threading.RLock()
         self._state = self._load()
         self._mark_interrupted_after_restart()
+        self._dedupe_duplicate_sources()
         self.reconcile_sources()
 
     def _load(self) -> dict[str, Any]:
@@ -106,6 +108,174 @@ class FileTaskStore:
             with self._mutate():
                 pass
 
+    def _dedupe_duplicate_sources(self) -> None:
+        """Collapse same-content raw files into one source, file + records.
+
+        ``reconcile_sources`` matches raw files to the hashes registry by
+        FILENAME, so an upload whose name differs from the registered raw path
+        (e.g. an arXiv ``2605.15184v1.pdf`` vs the registered
+        ``2605-15184v1.pdf``) gets seeded as a fresh ``pending`` source even
+        though its bytes are already in the KB. This pass runs once per store
+        instantiation (before reconcile, so reconcile never re-seeds): it hashes
+        only raw files whose basename is NOT a registered raw path, and for each
+        content hash already in the registry it keeps the registered file,
+        deletes the duplicate copies and their task records, promotes/backfills
+        the surviving file's record to ``succeeded``, and points the registry
+        at the kept file. After a clean pass the unregistered-name set is empty,
+        so restarts hash nothing.
+        """
+        raw_dir = self.kb_dir / "raw"
+        if not raw_dir.exists():
+            return
+        hashes_path = self.kb_dir / ".openkb" / "hashes.json"
+        try:
+            hashes = (
+                json.loads(hashes_path.read_text(encoding="utf-8")) if hashes_path.exists() else {}
+            )
+        except (OSError, json.JSONDecodeError):
+            hashes = {}
+        if not isinstance(hashes, dict) or not hashes:
+            return
+
+        registered_raw_names = {
+            Path(str(meta.get("raw_path") or meta.get("path") or meta.get("name") or "")).name
+            for meta in hashes.values()
+            if isinstance(meta, dict)
+        }
+        registered_raw_names.discard("")
+        candidates = [
+            path
+            for path in raw_dir.iterdir()
+            if path.is_file() and path.name not in registered_raw_names
+        ]
+        if not candidates:
+            return
+
+        groups: dict[str, list[Path]] = {}
+        for path in candidates:
+            try:
+                digest = HashRegistry.hash_file(path)
+            except OSError:
+                continue
+            groups.setdefault(digest, []).append(path)
+
+        registry_changed = False
+        with self._mutate():
+            for digest, paths in groups.items():
+                meta = hashes.get(digest)
+                if not isinstance(meta, dict):
+                    # Same-content files with no registry entry are ambiguous;
+                    # never guess which to delete.
+                    continue
+                raw_ref = meta.get("raw_path") or meta.get("path") or meta.get("name")
+                canonical_name = Path(str(raw_ref)).name if raw_ref else None
+                canonical = (raw_dir / canonical_name) if canonical_name else None
+                kept = None
+                if canonical is not None and canonical.is_file():
+                    # Only adopt the registered file when its bytes really match
+                    # the duplicated content; a replaced same-named file (bytes
+                    # differ) must not swallow the content-bearing candidates.
+                    try:
+                        if HashRegistry.hash_file(canonical) == digest:
+                            kept = canonical
+                    except OSError:
+                        pass
+                if kept is None:
+                    kept = next(
+                        (
+                            p
+                            for p in paths
+                            if self._task_for_raw(p.name, include_deleted=False) is not None
+                        ),
+                        paths[0],
+                    )
+                for path in paths:
+                    if path == kept:
+                        continue
+                    self._remove_raw_task_records(path.name)
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+                new_raw = f"raw/{kept.name}"
+                if (
+                    meta.get("raw_path") != new_raw
+                    or meta.get("path") != new_raw
+                    or meta.get("name") != kept.name
+                ):
+                    meta = dict(meta)
+                    meta["raw_path"] = new_raw
+                    meta["path"] = new_raw
+                    meta["name"] = kept.name
+                    hashes[digest] = meta
+                    registry_changed = True
+                self._ensure_succeeded_record_locked(kept.name, digest, meta)
+            if registry_changed:
+                # Rewrite the registry snapshot: ``hashes[digest] = meta`` kept
+                # the in-memory copy in sync with the normalized raw path/name.
+                atomic_write_json(hashes_path, hashes)
+            # ``_mutate`` writes ``self._state`` (file-tasks.json) on exit.
+
+    def _task_for_raw(
+        self, raw_name: str, *, include_deleted: bool
+    ) -> dict[str, Any] | None:
+        items = self._state["files"].values()
+        if not include_deleted:
+            items = (item for item in items if item.get("status") != "deleted")
+        return next(
+            (item for item in items if item.get("raw_path") == raw_name), None
+        )
+
+    def _remove_raw_task_records(self, raw_name: str) -> None:
+        for file_id in [
+            fid
+            for fid, item in self._state["files"].items()
+            if item.get("raw_path") == raw_name
+        ]:
+            del self._state["files"][file_id]
+
+    def _ensure_succeeded_record_locked(
+        self, raw_name: str, digest: str, meta: dict[str, Any]
+    ) -> None:
+        """Leave exactly one non-deleted ``succeeded`` task for ``raw_name``.
+
+        Promotes an existing ``pending`` record (the file was on disk but never
+        compiled to a task state) and backfills missing ``source_hash`` /
+        ``document_name`` so the record resolves to the registered document.
+        """
+        items = [
+            item
+            for item in self._state["files"].values()
+            if item.get("raw_path") == raw_name and item.get("status") != "deleted"
+        ]
+        doc_name = meta.get("doc_name")
+        if not items:
+            self._create_file_locked(
+                name=raw_name,
+                raw_path=raw_name,
+                status="succeeded",
+                source_hash=digest,
+                document_name=doc_name,
+                created_by="legacy",
+            )
+            return
+        primary = items[0]
+        primary.update(
+            {
+                "status": "succeeded",
+                "step": "finalize",
+                "completed_steps": 4,
+                "total_steps": 4,
+                "error": None,
+            }
+        )
+        if not primary.get("source_hash"):
+            primary["source_hash"] = digest
+        if doc_name and not primary.get("document_name"):
+            primary["document_name"] = doc_name
+        for item in items[1:]:
+            del self._state["files"][item["id"]]
+
     def reconcile_sources(self) -> None:
         """Seed legacy compiled/pending sources without overwriting task state."""
         raw_dir = self.kb_dir / "raw"
@@ -150,9 +320,21 @@ class FileTaskStore:
                 )
                 changed = True
             if raw_dir.exists():
+                registered_digests = set(hashes)
                 for path in raw_dir.iterdir():
                     if not path.is_file() or path.name in registered or path.name in known_paths:
                         continue
+                    # A file whose content hash is already registered under a
+                    # different name is a duplicate source - delete it instead
+                    # of seeding a fresh pending record. Only reached for names
+                    # with no task/registry entry, so the polling path stays
+                    # hash-free.
+                    try:
+                        if HashRegistry.hash_file(path) in registered_digests:
+                            path.unlink()
+                            continue
+                    except OSError:
+                        pass
                     self._create_file_locked(
                         name=path.name,
                         raw_path=path.name,

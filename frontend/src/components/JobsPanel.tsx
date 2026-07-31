@@ -4,7 +4,7 @@ import {
   Ban,
   CheckCircle2,
   Circle,
-  CircleSlash2,
+  Clock,
   ListTree,
   Loader2,
   RotateCcw,
@@ -20,12 +20,13 @@ function UploadStatusIcon({ status }: { status: UploadStatus }) {
     case 'uploading':
     case 'processing':
       return <Loader2 className="h-4 w-4 animate-spin text-accent-brand" />
-    case 'uploaded':
     case 'added':
-      return <CheckCircle2 className="h-4 w-4 text-emerald-500 dark:text-emerald-400" />
     case 'skipped':
     case 'exists':
-      return <CircleSlash2 className="h-4 w-4 text-muted-foreground" />
+      return <CheckCircle2 className="h-4 w-4 text-emerald-500 dark:text-emerald-400" />
+    case 'uploaded':
+    case 'pending':
+      return <Clock className="h-4 w-4 text-muted-foreground" />
     case 'failed':
     case 'interrupted':
       return <XCircle className="h-4 w-4 text-red-500 dark:text-red-400" />
@@ -39,7 +40,14 @@ function UploadStatusIcon({ status }: { status: UploadStatus }) {
 function FileStatus({ file }: { file: UploadFileState }) {
   const { t } = useTranslation('kb')
   const total = Math.max(file.totalSteps, 1)
-  const completed = Math.min(file.completedSteps, total)
+  // A source that has been uploaded but not yet compiled shows 0 progress even
+  // if the persisted task records completed_steps=4 (the file-tasks JSON writes
+  // a placeholder 4/4 for pending rows; it is only meaningful once compiling).
+  // `exists` rows (client-deduped duplicates) are already compiled in the KB.
+  const completed =
+    file.status === 'uploaded' || file.status === 'pending'
+      ? 0
+      : Math.min(file.completedSteps, total)
   return (
     <div className="w-[112px] shrink-0 text-right">
       <div className="text-[10.5px] font-medium text-muted-foreground">{t(`upload.fileStatus.${file.status}`)}</div>
@@ -143,11 +151,8 @@ export default function JobsPanel({
         <div className="mt-4 border-y border-dashed border-[hsl(var(--glass-border))] py-12 text-center text-[13px] text-muted-foreground">{t('jobs.empty')}</div>
       ) : (
         <>
-            <div className="mt-4">
+            <div className="mt-3">
               <section className="min-w-0">
-                <div className="flex items-center justify-between gap-3 border-b border-[hsl(var(--glass-border))] pb-2">
-                  <h4 className="text-[12px] font-semibold text-muted-foreground">{t('upload.progressHeading', { count: files.length })}</h4>
-                </div>
                 <div className="max-h-[420px] overflow-y-auto border-b border-[hsl(var(--glass-border))]">
                   {files.map((file) => {
                     const document = documentsByName.get(file.name) || (file.sourceHash ? documentsByHash.get(file.sourceHash) : undefined)
@@ -165,6 +170,16 @@ export default function JobsPanel({
                     const displayFile = recompiling
                       ? { ...file, status: 'processing' as UploadStatus, completedSteps: 2, totalSteps: 4, step: 'compile' }
                       : file
+                    // Left caption carries only what the right-hand status column
+                    // does not: an in-progress step, or a failure's diagnostic
+                    // message. Terminal successes (added/skipped/exists/cancelled)
+                    // need no caption - the status column already reads "Compiled".
+                    const caption =
+                      displayFile.status === 'failed' || displayFile.status === 'interrupted'
+                        ? displayFile.message || t(`upload.fileStatus.${displayFile.status}`)
+                        : displayFile.status === 'uploading' || displayFile.status === 'processing'
+                          ? displayFile.message || t(`jobs.steps.${displayFile.step}`)
+                          : ''
                     return (
                       <div key={file.id} className="group grid grid-cols-[minmax(0,1fr)_112px_auto] items-center gap-x-3 border-b border-[hsl(var(--glass-border))] py-2.5 last:border-b-0">
                         <div className="flex min-w-0 items-center gap-2.5">
@@ -182,7 +197,7 @@ export default function JobsPanel({
                             ) : (
                               <span className="block truncate text-[12.5px] font-medium text-foreground">{file.name}</span>
                             )}
-                            <span className="mt-0.5 block truncate text-[10.5px] text-muted-foreground">{recompiling ? t('jobs.steps.compile') : file.message || t(`jobs.steps.${file.step}`)}</span>
+                            <span className="mt-0.5 block truncate text-[10.5px] text-muted-foreground">{caption}</span>
                           </span>
                         </div>
                         <FileStatus file={displayFile} />
@@ -267,7 +282,7 @@ export default function JobsPanel({
                 </div>
               </section>
 
-              <section className="mt-6 min-w-0 border-t border-[hsl(var(--glass-border))] pt-4">
+              <section className="mt-4 min-w-0 border-t border-[hsl(var(--glass-border))] pt-3">
                 <h4 className="flex items-center gap-1.5 text-[12px] font-semibold text-muted-foreground">
                   <ListTree className="h-3.5 w-3.5" />
                   {t('upload.logHeading')}

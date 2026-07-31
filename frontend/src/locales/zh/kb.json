@@ -16,11 +16,9 @@
     "successToast": "上传完成：{{summary}}",
     "existsToast": "文档已存在，未新增：{{summary}}",
     "incompleteToast": "上传中断：未收到完成信号，请刷新确认结果",
-    "note": "上传的文档进入本地 raw/ 并自动编译进知识库；文件仅保存在本机",
     "inProgress": "正在上传并编译…",
     "dropzone": "拖放文件到此处，或点击选择",
     "dropzoneHint": "支持 PDF / Word / Markdown / 文本等，可多选",
-    "progressHeading": "本地来源 · {{count}}",
     "cancel": "取消任务",
     "cancelling": "正在取消…",
     "compile": "编译",
@@ -31,13 +29,13 @@
     "logEmpty": "暂无日志，任务开始后会在这里实时显示",
     "fileStatus": {
       "uploading": "正在上传",
-      "uploaded": "已上传",
-      "pending": "等待中",
+      "uploaded": "待编译",
+      "pending": "待编译",
       "processing": "编译中…",
       "added": "已编译",
-      "skipped": "已跳过",
-      "exists": "已存在",
-      "failed": "失败",
+      "skipped": "已跳过（重复来源）",
+      "exists": "已存在（重复来源）",
+      "failed": "编译失败",
       "cancelled": "已取消",
       "interrupted": "服务重启中断"
     }
@@ -127,7 +125,6 @@
   "workspace": {
     "eyebrow": "文档工作台",
     "title": "管理知识来源",
-    "addFiles": "添加文件",
     "createTask": "添加本地来源",
     "createTaskNote": "上传后会自动解析并编译到此知识库。",
     "libraryNote": "查看原始文档，或移除不再需要的来源。",

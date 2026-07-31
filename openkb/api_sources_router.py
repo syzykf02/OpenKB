@@ -14,6 +14,7 @@ from openkb.api_models import CompilePendingDocumentRequest, KbRequest, ListResp
 from openkb.cli import SUPPORTED_EXTENSIONS, get_kb_list
 from openkb.config import resolve_credential_bundle
 from openkb.locks import kb_ingest_lock
+from openkb.schema import read_entity_types
 
 sources_router = APIRouter()
 
@@ -36,7 +37,9 @@ async def list_sources_endpoint(
     """Return compiled and pending source inventory for a knowledge base."""
     kb_dir = _resolve_kb(request.kb)
     try:
-        return ListResponse(**await run_in_threadpool(get_kb_list, kb_dir))
+        data = await run_in_threadpool(get_kb_list, kb_dir)
+        data["entity_types"] = read_entity_types(kb_dir / "wiki" / "entities")
+        return ListResponse(**data)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"List failed: {exc}") from exc
 

@@ -2,6 +2,7 @@ import { useMemo, useState } from "react"
 import { useTranslation } from "react-i18next"
 import { FileText } from "lucide-react"
 import type { KbInventory } from "@/api/wiki"
+import { entityTypeBadgeClass } from "@/lib/entityTypes"
 import { cn } from "@/lib/utils"
 
 const PAGE_SIZE = 50
@@ -50,6 +51,7 @@ export default function PageList({
         ) : (
           slice.map((name) => {
             const path = pathFor(type, name)
+            const entityType = type === 'entities' ? inv?.entity_types?.[name] : undefined
             return (
               <button
                 key={path}
@@ -62,7 +64,17 @@ export default function PageList({
                 )}
               >
                 <FileText className="w-3.5 h-3.5 shrink-0 opacity-50" />
-                <span className="truncate font-mono2 text-[12px]">{name}</span>
+                <span className="min-w-0 flex-1 truncate font-mono2 text-[12px]">{name}</span>
+                {entityType && (
+                  <span
+                    className={cn(
+                      "shrink-0 rounded px-1.5 py-px text-[9.5px] font-semibold uppercase tracking-wide leading-[1.4]",
+                      entityTypeBadgeClass(entityType),
+                    )}
+                  >
+                    {entityType}
+                  </span>
+                )}
               </button>
             )
           })
