@@ -536,6 +536,14 @@ def _add_single_file_locked(
                 click.echo(f"  [ERROR] Indexing failed: {exc}")
                 logger.debug("Indexing traceback:", exc_info=True)
                 raise
+            except BaseException:
+                # A cancelled PageIndex subprocess may have created a blob but
+                # not returned its doc id. Record every blob newly observed
+                # since this mutation began so the existing rollback removes
+                # it along with the restored SQLite state.
+                if files_root.exists():
+                    snapshot.track_new([p for p in files_root.glob("*/*") if p not in blobs_before])
+                raise
 
             # Register only the newly-created blob artifacts for this doc (the
             # {doc_id} file + its images dir) — the append-only store means the

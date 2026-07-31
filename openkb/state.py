@@ -83,6 +83,16 @@ class HashRegistry:
         self._data[file_hash] = metadata
         self._persist()
 
+    def update_entries(self, mapping: dict[str, dict]) -> None:
+        """Merge several hash -> metadata entries and persist once.
+
+        Batch form of :meth:`add` for callers that rewrite many entries at
+        once (e.g. normalizing raw paths after a dedupe) — avoids N separate
+        disk writes.
+        """
+        self._data.update(mapping)
+        self._persist()
+
     def remove_by_doc_name(self, doc_name: str) -> bool:
         """Remove the entry whose metadata['doc_name'] matches. Returns True if removed."""
         for file_hash, meta in list(self._data.items()):

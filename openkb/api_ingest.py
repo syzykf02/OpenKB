@@ -100,6 +100,8 @@ def start_add_job(
     saved_uploads: list[tuple[Path, str]],
     *,
     bundle=None,
+    store=None,
+    existing_file_ids: list[str] | None = None,
 ) -> Job:
     """Create and submit the add job for uploaded (already saved) files.
 
@@ -108,7 +110,15 @@ def start_add_job(
     """
     first = saved_uploads[0][1] if saved_uploads else "?"
     title = f"add: {first}" + (f" (+{len(saved_uploads) - 1})" if len(saved_uploads) > 1 else "")
-    job = registry.create("add", kb, title)
+    job = registry.create("add", kb, title, store=store)
+    if store is not None:
+        job.file_ids = store.create_job(
+            job.id,
+            kind="add",
+            title=title,
+            files=saved_uploads,
+            existing_file_ids=existing_file_ids,
+        )
     job.record(
         "start",
         {
@@ -320,3 +330,86 @@ async def _add_file_for_job(
         saved_path.unlink(missing_ok=True)
         item.saved_path = None
     return item
+
+
+def start_recompile_job(
+    registry: JobRegistry,
+    kb: str,
+    kb_dir: Path,
+    *,
+    file_id: str,
+    document_name: str,
+    store,
+    bundle=None,
+) -> Job:
+    """Create a persistent recompile job for one already-indexed source."""
+    title = f"recompile: {document_name}"
+    job = registry.create("recompile", kb, title, store=store)
+    job.file_ids = store.create_job(
+        job.id,
+        kind="recompile",
+        title=title,
+        files=[],
+        existing_file_ids=[file_id],
+    )
+    job.record("start", {"endpoint": "recompile", "kb": kb, "file_count": 1})
+    registry.submit(
+        job,
+        lambda current: run_recompile_worker(current, kb_dir, document_name, bundle=bundle),
+    )
+    return job
+
+
+async def run_recompile_worker(
+    job: Job, kb_dir: Path, document_name: str, *, bundle=None
+) -> dict[str, Any]:
+    """Run the existing recompile pipeline while projecting it onto one file row."""
+    from openkb.cli import iter_recompile
+
+    token = cancel_event_var.set(job.cancel_event)
+    try:
+        job.record(
+            "file_start",
+            {
+                "file_index": 0,
+                "original_name": document_name,
+                "completed_steps": 1,
+                "total_steps": 4,
+                "step": "compile",
+            },
+        )
+        job.record(
+            "file_progress",
+            {
+                "file_index": 0,
+                "completed_steps": 2,
+                "total_steps": 4,
+                "step": "compile",
+                "message": "Recompiling knowledge-base pages.",
+            },
+        )
+        final: dict[str, Any] = {}
+        async for event in iter_recompile(kb_dir, document_name, bundle=bundle):
+            event_name = event.get("event")
+            if event_name == "error":
+                raise RuntimeError(str(event.get("message", "Recompile failed.")))
+            if event_name == "doc":
+                ok = event.get("status") == "ok"
+                job.record(
+                    "file_done",
+                    {
+                        "file_index": 0,
+                        "original_name": document_name,
+                        "status": "added" if ok else "failed",
+                        "message": event.get("message")
+                        or ("Recompiled." if ok else "Recompile failed."),
+                        "completed_steps": 4 if ok else 2,
+                        "total_steps": 4,
+                        "step": "finalize" if ok else "compile",
+                    },
+                )
+            elif event_name == "final":
+                final = dict(event)
+        return final
+    finally:
+        cancel_event_var.reset(token)

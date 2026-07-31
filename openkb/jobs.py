@@ -65,6 +65,11 @@ class Job:
     # Worker-thread ident for log capture (set by the worker, read by its
     # logging handler); None until the first worker thread binds it.
     thread_id: int | None = None
+    # Persistent file-task store and file ids are attached by API job creators.
+    # CLI/internal users can leave both empty and retain the lightweight
+    # in-memory registry behavior.
+    store: Any | None = None
+    file_ids: list[str] = field(default_factory=list)
 
     _seq: itertools.count = field(default_factory=lambda: itertools.count())
     _events: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=MAX_EVENTS_PER_JOB))
@@ -98,6 +103,8 @@ class Job:
         """
         frame = {"seq": next(self._seq), "event": event, "data": data}
         self._events.append(frame)
+        if self.store is not None:
+            self.store.record_event(self, event, data)
         for queue in list(self._subscribers):
             queue.put_nowait(frame)
 
@@ -147,8 +154,8 @@ class JobRegistry:
         self._jobs: dict[str, Job] = {}
         self._kb_serializers: dict[str, asyncio.Lock] = {}
 
-    def create(self, kind: str, kb: str, title: str) -> Job:
-        job = Job(id=uuid.uuid4().hex[:12], kind=kind, kb=kb, title=title)
+    def create(self, kind: str, kb: str, title: str, *, store=None) -> Job:
+        job = Job(id=uuid.uuid4().hex[:12], kind=kind, kb=kb, title=title, store=store)
         self._jobs[job.id] = job
         self._prune_finished(kb)
         return job
@@ -157,7 +164,7 @@ class JobRegistry:
         return self._jobs.get(job_id)
 
     def list(self, kb: str | None = None, *, active_only: bool = False) -> list[Job]:
-        jobs = self._jobs.values()
+        jobs = list(self._jobs.values())
         if kb is not None:
             jobs = [j for j in jobs if j.kb == kb]
         if active_only:
@@ -193,11 +200,15 @@ class JobRegistry:
             if job.cancelled:
                 job.status = "cancelled"
                 job.finished_at = time.time()
+                if job.store is not None:
+                    job.store.update_job(job)
                 job.record("cancelled", {"message": "Cancelled while queued"})
                 job.record("done", {"status": job.status})
                 return
             job.status = "running"
             job.started_at = time.time()
+            if job.store is not None:
+                job.store.update_job(job)
             try:
                 result = await worker(job)
             except IngestCancelled:
@@ -213,6 +224,8 @@ class JobRegistry:
                 job.record("final", result or {})
             finally:
                 job.finished_at = time.time()
+                if job.store is not None:
+                    job.store.update_job(job)
                 job.record("done", {"status": job.status})
 
     def _prune_finished(self, kb: str) -> None:

@@ -888,10 +888,12 @@ def test_list_endpoint_returns_empty_inventory(monkeypatch, kb_dir):
     assert response.status_code == 200
     assert response.json() == {
         "documents": [],
+        "pending_documents": [],
         "document_count": 0,
         "summaries": [],
         "concepts": [],
         "entities": [],
+        "entity_types": {},
         "reports": [],
     }
 
@@ -946,13 +948,18 @@ def test_list_endpoint_includes_entities(monkeypatch, kb_dir):
         json.dumps({"h1": {"name": "p.pdf", "type": "pdf"}}), encoding="utf-8"
     )
     (kb_dir / "wiki" / "entities").mkdir(parents=True, exist_ok=True)
-    (kb_dir / "wiki" / "entities" / "nvidia.md").write_text("# NVIDIA", encoding="utf-8")
+    (kb_dir / "wiki" / "entities" / "nvidia.md").write_text(
+        "---\ntype: Organization\n---\n# NVIDIA", encoding="utf-8"
+    )
     (kb_dir / "wiki" / "entities" / "anthropic.md").write_text("# Anthropic", encoding="utf-8")
 
     response = client.post("/api/v1/list", json={"kb": kb}, headers=_auth())
 
     assert response.status_code == 200
     assert response.json()["entities"] == ["anthropic", "nvidia"]
+    # entity_types maps each stem to its lowercased frontmatter `type`; a page
+    # with no frontmatter falls back to "other".
+    assert response.json()["entity_types"] == {"anthropic": "other", "nvidia": "organization"}
 
 
 def test_list_includes_uploaded_uncompiled_sources_and_can_resume_them(monkeypatch, kb_dir):
@@ -3733,3 +3740,47 @@ def test_add_job_cancel_endpoint_stops_batch(monkeypatch, kb_dir):
         assert cancelled_files[0]["data"]["original_name"] == "one.md"
         assert "cancelled" in names and "final" not in names
         assert names[-1] == "done"
+
+
+def test_file_task_api_persists_compile_state_and_deleted_history(monkeypatch, kb_dir):
+    """The file-first API survives polling independently from the SSE ring."""
+    client = _client(monkeypatch)
+    kb = _use_named_kb(monkeypatch, kb_dir)
+    raw = kb_dir / "raw" / "queued.md"
+    raw.write_text("# queued", encoding="utf-8")
+
+    from openkb.cli import AddFileResult
+
+    def fake_add(path, target_kb, **kwargs):
+        return AddFileResult(path.name, str(path), "added", "added")
+
+    monkeypatch.setattr("openkb.api_helpers._add_for_api", fake_add)
+
+    with client:
+        listed = client.get(f"/api/v1/file-tasks?kb={kb}", headers=_auth())
+        assert listed.status_code == 200
+        task = next(item for item in listed.json()["files"] if item["name"] == "queued.md")
+        assert task["status"] == "pending"
+
+        accepted = client.post(
+            f"/api/v1/file-tasks/{task['id']}/compile",
+            json={"kb": kb},
+            headers=_auth(),
+        )
+        assert accepted.status_code == 200
+        assert _wait_for_job(client, accepted.json()["job_id"])["status"] == "done"
+
+        compiled = client.get(f"/api/v1/file-tasks?kb={kb}", headers=_auth()).json()["files"]
+        assert next(item for item in compiled if item["id"] == task["id"])["status"] == "succeeded"
+
+        deleted = client.request(
+            "DELETE", f"/api/v1/file-tasks/{task['id']}", json={"kb": kb}, headers=_auth()
+        )
+        assert deleted.status_code == 200
+        assert not raw.exists()
+        visible = client.get(f"/api/v1/file-tasks?kb={kb}", headers=_auth()).json()["files"]
+        assert all(item["id"] != task["id"] for item in visible)
+        history = client.get(
+            f"/api/v1/file-tasks?kb={kb}&include_deleted=true", headers=_auth()
+        ).json()["files"]
+        assert next(item for item in history if item["id"] == task["id"])["status"] == "deleted"

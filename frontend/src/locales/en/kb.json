@@ -16,11 +16,9 @@
     "successToast": "Upload complete: {{summary}}",
     "existsToast": "Documents already exist, nothing added: {{summary}}",
     "incompleteToast": "Upload interrupted: no completion signal received; refresh to check results",
-    "note": "Uploaded documents go into the local raw/ folder and are compiled into the KB automatically; files stay on this machine",
     "inProgress": "Uploading and compiling…",
     "dropzone": "Drop files here, or click to choose",
     "dropzoneHint": "PDF / Word / Markdown / text and more; multi-select supported",
-    "progressHeading": "Local sources · {{count}}",
     "cancel": "Cancel task",
     "cancelling": "Cancelling…",
     "compile": "Compile",
@@ -31,14 +29,15 @@
     "logEmpty": "No log entries yet. Live updates will appear here when the task starts.",
     "fileStatus": {
       "uploading": "Uploading…",
-      "uploaded": "Uploaded",
-      "pending": "Waiting",
+      "uploaded": "Waiting to compile",
+      "pending": "Waiting to compile",
       "processing": "Compiling…",
       "added": "Compiled",
-      "skipped": "Skipped",
-      "exists": "Already in KB",
-      "failed": "Failed",
-      "cancelled": "Cancelled"
+      "skipped": "Skipped (duplicate)",
+      "exists": "Already in KB (duplicate)",
+      "failed": "Compile failed",
+      "cancelled": "Cancelled",
+      "interrupted": "Interrupted by restart"
     }
   },
   "jobs": {
@@ -126,7 +125,6 @@
   "workspace": {
     "eyebrow": "Document workspace",
     "title": "Manage knowledge sources",
-    "addFiles": "Add files",
     "createTask": "Add local sources",
     "createTaskNote": "Files are parsed and compiled into this knowledge base automatically.",
     "libraryNote": "Review source documents or remove sources you no longer need.",

@@ -164,6 +164,7 @@ class ListResponse(BaseModel):
     summaries: list[str]
     concepts: list[str]
     entities: list[str]
+    entity_types: dict[str, str] = {}
     reports: list[str]
 
 

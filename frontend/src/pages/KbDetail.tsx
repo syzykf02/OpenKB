@@ -3,7 +3,7 @@ import { useNavigate, useParams } from 'react-router'
 import { useTranslation } from 'react-i18next'
 import * as Dialog from '@radix-ui/react-dialog'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
-import { Cloud, ChevronDown, ChevronLeft, ChevronRight, Eye, FileText, Link2, ListChecks, ListTree, Loader2, Pencil, Plus, RefreshCw, Upload, Settings2, Trash2, X, type LucideIcon } from 'lucide-react'
+import { Cloud, ChevronDown, ChevronLeft, ChevronRight, Eye, FileText, Link2, ListChecks, ListTree, Loader2, Pencil, RefreshCw, Upload, Settings2, Trash2, X, type LucideIcon } from 'lucide-react'
 import { toast } from 'sonner'
 import { deletePage, editPage, getDocumentSource, getKbInventory, getPage, getPageLinks, type DocumentSource, type KbInventory, type PendingDocument, type WikiDocument } from '@/api/wiki'
 import { getDocirByHash, type DocirNode } from '@/api/legal'
@@ -362,6 +362,7 @@ export default function KbDetail() {
             onCancelFile={jobs.cancelFile}
             onRetryFile={jobs.retryFile}
             onCompilePendingFile={jobs.compilePendingFile}
+            onDeleteFile={jobs.deleteFile}
           />
         ) : section === 'legal-graph' ? (
           <LegalGraphView kb={id} />
@@ -768,6 +769,7 @@ function DocumentsPane({
   onCancelFile,
   onRetryFile,
   onCompilePendingFile,
+  onDeleteFile,
 }: {
   kb: string
   documents: WikiDocument[]
@@ -785,6 +787,7 @@ function DocumentsPane({
   onCancelFile: (file: CompileTaskFile) => void
   onRetryFile: (file: CompileTaskFile) => void
   onCompilePendingFile: (document: PendingDocument) => void
+  onDeleteFile: (file: CompileTaskFile) => void
 }) {
   const { t } = useTranslation(['kb', 'common'])
   const reduce = useReducedMotion()
@@ -859,7 +862,7 @@ function DocumentsPane({
   return (
     <>
       <div className="h-full overflow-y-auto scroll-edge-top">
-        <div className="mx-auto max-w-[1120px] px-6 py-7 lg:px-10">
+        <div className="mx-auto max-w-[1120px] px-6 py-5 lg:px-10 lg:py-6">
           <input
             ref={fileInputRef}
             type="file"
@@ -871,27 +874,17 @@ function DocumentsPane({
             }}
           />
 
-          <div className="flex flex-col gap-5 border-b border-[hsl(var(--glass-border))] pb-5 sm:flex-row sm:items-end sm:justify-between">
+          <div className="border-b border-[hsl(var(--glass-border))] pb-4">
             <div>
               <div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-accent-brand">
                 <span className="h-1.5 w-1.5 rounded-full bg-accent-brand" />
                 {t('kb:workspace.eyebrow')}
               </div>
               <h2 className="mt-2 text-[25px] font-bold tracking-tight text-foreground">{t('kb:workspace.title')}</h2>
-              <p className="mt-1.5 max-w-xl text-[13px] leading-relaxed text-muted-foreground">{t('kb:upload.note')}</p>
             </div>
-            <button
-              type="button"
-              onClick={() => !uploading && fileInputRef.current?.click()}
-              disabled={uploading}
-              className="inline-flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-lg bg-accent-brand px-3.5 text-[12.5px] font-semibold text-white shadow-sm transition hover:bg-accent-brand/90 disabled:cursor-wait disabled:opacity-60"
-            >
-              {uploading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Plus className="h-3.5 w-3.5" />}
-              {uploading ? t('kb:upload.inProgress') : t('kb:workspace.addFiles')}
-            </button>
           </div>
 
-          <Tabs value={activeTab} onValueChange={(value) => setActiveTab(value as DocumentsTab)} className="mt-5 gap-0">
+          <Tabs value={activeTab} onValueChange={(value) => setActiveTab(value as DocumentsTab)} className="mt-3 gap-0">
             <TabsList className="h-auto w-full justify-start gap-1 overflow-x-auto rounded-none border-b border-[hsl(var(--glass-border))] bg-transparent p-0">
               <WorkspaceTab value="jobs" icon={ListChecks} label={t('kb:workspace.tabs.jobs')} count={fileCount} />
               <WorkspaceTab value="remote" icon={Cloud} label={t('kb:workspace.tabs.remote')} />
@@ -905,7 +898,7 @@ function DocumentsPane({
               animate={{ opacity: 1, y: 0 }}
               exit={reduce ? undefined : { opacity: 0, y: -5 }}
               transition={reduce ? { duration: 0.1 } : { duration: 0.18, ease: 'easeOut' }}
-              className="py-6"
+              className="py-4"
             >
               {activeTab === 'jobs' && (
                 <CompileJobsTab
@@ -922,6 +915,7 @@ function DocumentsPane({
                   onCancelFile={onCancelFile}
                   onRetryFile={onRetryFile}
                   onCompilePendingFile={onCompilePendingFile}
+                  onDeleteFile={onDeleteFile}
                   onPreviewDocument={setPreviewDocument}
                   recompilingDocumentNames={recompilingDocumentNames}
                   onRecompileDocument={recompileDocument}
@@ -1233,6 +1227,7 @@ function CompileJobsTab({
   onCancelFile,
   onRetryFile,
   onCompilePendingFile,
+  onDeleteFile,
   onPreviewDocument,
   recompilingDocumentNames,
   onRecompileDocument,
@@ -1253,6 +1248,7 @@ function CompileJobsTab({
   onCancelFile: (file: CompileTaskFile) => void
   onRetryFile: (file: CompileTaskFile) => void
   onCompilePendingFile: (document: PendingDocument) => void
+  onDeleteFile: (file: CompileTaskFile) => void
   onPreviewDocument: (document: WikiDocument) => void
   recompilingDocumentNames: ReadonlySet<string>
   onRecompileDocument: (document: WikiDocument) => void
@@ -1262,46 +1258,46 @@ function CompileJobsTab({
 }) {
   const { t } = useTranslation('kb')
   return (
-    <div className="grid gap-6 lg:grid-cols-[240px_minmax(0,1fr)]">
+    <div className="flex flex-col gap-5">
       <section>
-        <div className="flex items-baseline justify-between gap-4">
-          <div>
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between lg:gap-8">
+          <div className="shrink-0">
             <h3 className="text-[14px] font-semibold text-foreground">{t('workspace.createTask')}</h3>
             <p className="mt-1 text-[12px] text-muted-foreground">{t('workspace.createTaskNote')}</p>
           </div>
-        </div>
-        <div
-          onDragOver={(e) => {
-            e.preventDefault()
-            onDragActiveChange(true)
-          }}
-          onDragLeave={() => onDragActiveChange(false)}
-          onDrop={(e) => {
-            e.preventDefault()
-            onDragActiveChange(false)
-            onUpload(Array.from(e.dataTransfer.files))
-          }}
-          onClick={() => !uploading && onChooseFiles()}
-          className={cn(
-            'mt-3 min-h-[88px] cursor-pointer rounded-xl border-2 border-dashed px-3 py-3 text-left transition-all duration-200',
-            'flex items-center gap-3',
-            dragActive
-              ? 'border-accent-brand bg-accent-brand/[0.07] shadow-[inset_0_0_0_1px_hsl(var(--accent-brand)/0.1)]'
-              : 'border-[hsl(var(--glass-border))] bg-muted/[0.18] hover:border-accent-brand/50 hover:bg-accent-brand/[0.025]',
-            uploading && 'pointer-events-none opacity-70',
-          )}
-        >
-          <span className={cn('grid h-8 w-8 shrink-0 place-items-center rounded-lg transition-colors', dragActive ? 'bg-accent-brand text-white' : 'bg-background text-accent-brand shadow-sm')}>
-            {uploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
-          </span>
-          <div className="min-w-0">
-            <div className="text-[12px] font-semibold text-foreground">{uploading ? t('upload.inProgress') : t('upload.dropzone')}</div>
-            <div className="mt-0.5 text-[10.5px] leading-relaxed text-muted-foreground">{t('upload.dropzoneHint')}</div>
+          <div
+            onDragOver={(e) => {
+              e.preventDefault()
+              onDragActiveChange(true)
+            }}
+            onDragLeave={() => onDragActiveChange(false)}
+            onDrop={(e) => {
+              e.preventDefault()
+              onDragActiveChange(false)
+              onUpload(Array.from(e.dataTransfer.files))
+            }}
+            onClick={() => !uploading && onChooseFiles()}
+            className={cn(
+              'min-h-[76px] w-full cursor-pointer rounded-xl border-2 border-dashed px-3 py-3 text-left transition-all duration-200 lg:max-w-[560px]',
+              'flex items-center gap-3',
+              dragActive
+                ? 'border-accent-brand bg-accent-brand/[0.07] shadow-[inset_0_0_0_1px_hsl(var(--accent-brand)/0.1)]'
+                : 'border-[hsl(var(--glass-border))] bg-muted/[0.18] hover:border-accent-brand/50 hover:bg-accent-brand/[0.025]',
+              uploading && 'pointer-events-none opacity-70',
+            )}
+          >
+            <span className={cn('grid h-8 w-8 shrink-0 place-items-center rounded-lg transition-colors', dragActive ? 'bg-accent-brand text-white' : 'bg-background text-accent-brand shadow-sm')}>
+              {uploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+            </span>
+            <div className="min-w-0">
+              <div className="text-[12px] font-semibold text-foreground">{uploading ? t('upload.inProgress') : t('upload.dropzone')}</div>
+              <div className="mt-0.5 text-[10.5px] leading-relaxed text-muted-foreground">{t('upload.dropzoneHint')}</div>
+            </div>
           </div>
         </div>
       </section>
 
-      <section className="min-w-0 border-t border-[hsl(var(--glass-border))] pt-5 lg:border-l lg:border-t-0 lg:pl-8 lg:pt-0">
+      <section className="min-w-0 border-t border-[hsl(var(--glass-border))] pt-4">
         <JobsPanel
           taskFiles={taskFiles}
           documents={documents}
@@ -1311,6 +1307,7 @@ function CompileJobsTab({
           onCancelFile={onCancelFile}
           onRetryFile={onRetryFile}
           onCompilePendingFile={onCompilePendingFile}
+          onDeleteFile={onDeleteFile}
           onPreviewDocument={onPreviewDocument}
           recompilingDocumentNames={recompilingDocumentNames}
           onRecompileDocument={onRecompileDocument}

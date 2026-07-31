@@ -48,6 +48,8 @@ export interface KbInventory {
   summaries: string[]
   concepts: string[]
   entities: string[]
+  /** Entity stem → lowercase frontmatter `type` (e.g. `person`), for list badges. */
+  entity_types?: Record<string, string>
   reports: string[]
 }
 
