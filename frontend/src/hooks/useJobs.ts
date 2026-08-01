@@ -631,6 +631,16 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
   const retryFile = useCallback(
     async (file: CompileTaskFile) => {
       if (file.persistent) {
+        // Optimistically flip the row to compiling so the clicked file shows a
+        // spinner immediately; the poll then confirms the server's queued →
+        // running → succeeded transition.
+        setFileTasks((prev) =>
+          prev.map((task) =>
+            task.id === file.id
+              ? { ...task, status: 'running', step: 'compile', completed_steps: 2, total_steps: 4, message: null, error: null }
+              : task,
+          ),
+        )
         try {
           const accepted = await compileFileTask(kb, file.id)
           setServerJobs((prev) => [
@@ -660,6 +670,7 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
           void refreshFileTasks()
         } catch (e) {
           toast.error(errMsg(e))
+          void refreshFileTasks() // revert the optimistic flip to server truth
         }
         return
       }
