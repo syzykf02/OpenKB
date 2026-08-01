@@ -1080,7 +1080,7 @@ def test_cli_remove_calls_pageindex_delete_with_stored_doc_id(kb_dir):
     fake_client.collection.return_value = fake_col
 
     with (
-        patch("pageindex.PageIndexClient", return_value=fake_client) as mock_cls,
+        patch("openkb.vendor.pageindex.PageIndexClient", return_value=fake_client) as mock_cls,
         patch("openkb.cli._setup_llm_key"),
     ):
         result = _invoke(kb_dir, ["remove", "paper.pdf", "--keep-raw", "--yes"])
@@ -1111,7 +1111,7 @@ def test_cli_remove_pageindex_fallback_lookup_by_doc_name(kb_dir):
     fake_client.collection.return_value = fake_col
 
     with (
-        patch("pageindex.PageIndexClient", return_value=fake_client),
+        patch("openkb.vendor.pageindex.PageIndexClient", return_value=fake_client),
         patch("openkb.cli._setup_llm_key"),
     ):
         result = _invoke(kb_dir, ["remove", "paper.pdf", "--keep-raw", "--yes"])
@@ -1137,7 +1137,7 @@ def test_cli_remove_pageindex_fallback_skips_on_ambiguous_match(kb_dir):
     fake_client.collection.return_value = fake_col
 
     with (
-        patch("pageindex.PageIndexClient", return_value=fake_client),
+        patch("openkb.vendor.pageindex.PageIndexClient", return_value=fake_client),
         patch("openkb.cli._setup_llm_key"),
     ):
         result = _invoke(kb_dir, ["remove", "paper.pdf", "--keep-raw", "--yes"])
@@ -1157,7 +1157,7 @@ def test_cli_remove_skips_pageindex_when_no_state_file(kb_dir):
     _seed_two_doc_kb(kb_dir)
     assert not (kb_dir / ".openkb" / "pageindex.db").exists()
 
-    with patch("pageindex.PageIndexClient") as mock_cls:
+    with patch("openkb.vendor.pageindex.PageIndexClient") as mock_cls:
         result = _invoke(kb_dir, ["remove", "attention.pdf", "--yes"])
 
     assert result.exit_code == 0, result.output
@@ -1185,7 +1185,7 @@ def test_cli_remove_pageindex_failure_preserves_registry_for_retry(kb_dir):
     fake_client.collection.side_effect = RuntimeError("LLM key missing")
 
     with (
-        patch("pageindex.PageIndexClient", return_value=fake_client),
+        patch("openkb.vendor.pageindex.PageIndexClient", return_value=fake_client),
         patch("openkb.cli._setup_llm_key"),
     ):
         result = _invoke(kb_dir, ["remove", "paper.pdf", "--keep-raw", "--yes"])
@@ -1217,7 +1217,7 @@ def test_cli_remove_retry_after_pageindex_failure_completes(kb_dir):
     failing_client = MagicMock()
     failing_client.collection.side_effect = RuntimeError("transient")
     with (
-        patch("pageindex.PageIndexClient", return_value=failing_client),
+        patch("openkb.vendor.pageindex.PageIndexClient", return_value=failing_client),
         patch("openkb.cli._setup_llm_key"),
     ):
         first = _invoke(kb_dir, ["remove", "paper.pdf", "--keep-raw", "--yes"])
@@ -1232,7 +1232,7 @@ def test_cli_remove_retry_after_pageindex_failure_completes(kb_dir):
     working_client = MagicMock()
     working_client.collection.return_value = working_col
     with (
-        patch("pageindex.PageIndexClient", return_value=working_client),
+        patch("openkb.vendor.pageindex.PageIndexClient", return_value=working_client),
         patch("openkb.cli._setup_llm_key"),
     ):
         second = _invoke(kb_dir, ["remove", "paper.pdf", "--keep-raw", "--yes"])
@@ -1325,7 +1325,7 @@ def test_remove_cloud_doc_never_touches_pageindex(tmp_path):
     runner = CliRunner()
     with (
         patch("openkb.cli._find_kb_dir", return_value=tmp_path),
-        patch("pageindex.PageIndexClient") as mock_client,
+        patch("openkb.vendor.pageindex.PageIndexClient") as mock_client,
     ):
         result = runner.invoke(cli, ["remove", "cloud-doc", "--yes"])
 
@@ -1420,7 +1420,7 @@ def test_run_remove_for_api_pageindex_failure_is_partial(kb_dir):
     failing_client.collection.side_effect = RuntimeError("LLM key missing")
 
     with (
-        patch("pageindex.PageIndexClient", return_value=failing_client),
+        patch("openkb.vendor.pageindex.PageIndexClient", return_value=failing_client),
         patch("openkb.cli._setup_llm_key"),
     ):
         from openkb.cli import run_remove_for_api

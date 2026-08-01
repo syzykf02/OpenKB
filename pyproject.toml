@@ -32,13 +32,20 @@ keywords = ["ai", "rag", "retrieval", "knowledge-base", "llm", "pageindex", "age
 # returning empty Responses output (BerriAI/litellm#25429) and
 # auto-injects GitHub Copilot IDE-auth headers.
 dependencies = [
-    "pageindex==0.3.0.dev3",
     "markitdown[docx,pptx,xlsx,xls]==0.1.5",
     "trafilatura==2.0.0",
     "click==8.4.0",
     "watchdog==6.0.0",
     "litellm==1.87.2",
     "openai-agents==0.17.3",
+    # pageindex is vendored under openkb/vendor/ (no PyPI dependency); these are
+    # its module-level imports that were previously pulled in transitively as
+    # pageindex's own deps. Pinned here so a fresh sync still installs them.
+    "pydantic==2.13.4",
+    "pymupdf==1.27.2.3",
+    "PyPDF2==3.0.1",
+    "requests==2.34.2",
+    "typing-extensions==4.15.0",
     # openai 2.45.0 added a required `cache_write_tokens` field to
     # InputTokensDetails that openai-agents 0.17.3 does not set, crashing
     # usage parsing on every response (issue #187). Pin below 2.45 until
@@ -110,6 +117,8 @@ packages = ["openkb"]
 [tool.ruff]
 target-version = "py310"
 line-length = 100
+# Vendored third-party pageindex package — not our code, do not lint/format.
+extend-exclude = ["openkb/vendor"]
 
 [tool.ruff.lint]
 # Start conservative (pyflakes + pycodestyle errors + isort); ratchet up later.
@@ -183,3 +192,8 @@ disable_error_code = ["arg-type"]
 [[tool.mypy.overrides]]
 module = "openkb.skill.workspace"
 disable_error_code = ["type-var"]
+
+[[tool.mypy.overrides]]
+# Vendored third-party pageindex package — not our code, do not type-check.
+module = "openkb.vendor.*"
+ignore_errors = true

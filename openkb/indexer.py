@@ -4,14 +4,10 @@ from __future__ import annotations
 
 import json as json_mod
 import logging
-import multiprocessing
 import os
-import traceback
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
-
-from pageindex import IndexConfig, PageIndexClient
 
 from openkb.config import (
     DEFAULT_CONFIG,
@@ -20,18 +16,17 @@ from openkb.config import (
     resolve_concurrency,
     resolve_effective_config,
 )
-from openkb.ingest_cancel import cancel_event_var, check_cancelled
+from openkb.ingest_cancel import check_cancelled
 from openkb.tree_renderer import render_summary_md
+from openkb.vendor.pageindex import IndexConfig, PageIndexClient
 
 logger = logging.getLogger(__name__)
 
-# PageIndex currently exposes only a synchronous ``Collection.add()`` API. A
-# running add can spend many minutes in its own LLM calls, which a Python
-# thread cannot safely interrupt. API jobs therefore run that one operation in
-# a child process and poll the normal ingest cancellation flag while it runs.
-# The CLI does not install that flag and keeps the inexpensive direct call.
-_PAGEINDEX_CANCEL_POLL_SECONDS = 0.1
-_PAGEINDEX_PROCESS_STOP_SECONDS = 2.0
+# PageIndex (vendored) honours ``openkb.ingest_cancel.check_cancelled`` at every
+# LLM boundary inside its own add pipeline, so the blocking ``Collection.add()``
+# runs safely in the calling thread — no child process is needed to interrupt
+# it. On cancel, ``IngestCancelled`` (a BaseException) propagates out of ``add``
+# and the mutation system rolls back, exactly like the compile pipeline.
 
 
 @dataclass
@@ -70,62 +65,6 @@ class CloudImportData:
     all_pages: list
 
 
-def _index_config_payload(index_config: IndexConfig) -> dict[str, Any]:
-    """Return a spawn-safe PageIndex config payload.
-
-    ``IndexConfig`` is a Pydantic model in the supported PageIndex release.
-    Keeping the small ``__dict__`` fallback makes this boundary compatible
-    with lightweight stand-ins used by callers and tests.
-    """
-    model_dump = getattr(index_config, "model_dump", None)
-    if callable(model_dump):
-        return model_dump(mode="python")
-    return dict(vars(index_config))
-
-
-def _pageindex_add_process(
-    send_connection,
-    pdf_path: str,
-    *,
-    api_key: str | None,
-    model: str,
-    storage_path: str,
-    index_config: dict[str, Any],
-) -> None:
-    """Run PageIndex's uninterruptible add in a disposable child process."""
-    try:
-        client = PageIndexClient(
-            api_key=api_key,
-            model=model,
-            storage_path=storage_path,
-            index_config=index_config,
-        )
-        doc_id = client.collection().add(pdf_path)
-        send_connection.send(("ok", doc_id))
-    except BaseException as exc:
-        # Exception instances and tracebacks are not guaranteed pickle-safe,
-        # especially for errors raised by optional LLM providers.
-        send_connection.send(("error", type(exc).__name__, str(exc), traceback.format_exc()))
-    finally:
-        send_connection.close()
-
-
-def _stop_pageindex_process(process) -> None:
-    """Stop and reap a PageIndex child, escalating only when it ignores TERM."""
-    if not process.is_alive():
-        process.join()
-        return
-    process.terminate()
-    process.join(_PAGEINDEX_PROCESS_STOP_SECONDS)
-    if process.is_alive():
-        # ``kill`` exists on supported Python versions. Keep the guard for
-        # alternate process implementations used by embedding applications.
-        kill = getattr(process, "kill", None)
-        if callable(kill):
-            kill()
-        process.join()
-
-
 def _add_document_interruptibly(
     pdf_path: Path,
     *,
@@ -135,57 +74,19 @@ def _add_document_interruptibly(
     index_config: IndexConfig,
     collection=None,
 ) -> str:
-    """Add a PageIndex document, force-stopping it when an API job cancels.
+    """Add a PageIndex document, honouring cooperative cancellation.
 
-    PageIndex has no cancellation hook. The process boundary is deliberately
-    limited to ``add``: once it returns, the parent owns all reads/writes and
-    can use the existing cooperative checkpoints and mutation rollback.
+    The vendored PageIndex pipeline checks ``check_cancelled`` at each LLM
+    boundary, so ``add`` can run in the calling (worker) thread: on cancel,
+    ``IngestCancelled`` propagates out of ``add`` and the mutation system rolls
+    back. ``api_key``/``model``/``storage_path``/``index_config`` are accepted
+    to keep the retry-loop call site stable, but the client is created by the
+    caller (``index_long_document``) and passed in via ``collection``.
     """
     check_cancelled()
-    if cancel_event_var.get() is None:
-        if collection is None:
-            raise RuntimeError("A PageIndex collection is required outside an API job.")
-        return collection.add(str(pdf_path))
-
-    context = multiprocessing.get_context("spawn")
-    receive_connection, send_connection = context.Pipe(duplex=False)
-    process = context.Process(
-        target=_pageindex_add_process,
-        args=(send_connection, str(pdf_path)),
-        kwargs={
-            "api_key": api_key,
-            "model": model,
-            "storage_path": str(storage_path),
-            "index_config": _index_config_payload(index_config),
-        },
-        daemon=False,
-    )
-    process.start()
-    send_connection.close()
-    try:
-        while True:
-            check_cancelled()
-            if receive_connection.poll(_PAGEINDEX_CANCEL_POLL_SECONDS):
-                outcome = receive_connection.recv()
-                if outcome[0] == "ok":
-                    check_cancelled()
-                    return outcome[1]
-                _, error_type, message, child_traceback = outcome
-                raise RuntimeError(
-                    f"PageIndex indexing failed in child process ({error_type}): {message}\n"
-                    f"{child_traceback}"
-                )
-            if not process.is_alive():
-                # A hard crash may close the pipe before the child can publish
-                # its exception. Surface a useful error instead of polling
-                # forever.
-                raise RuntimeError(
-                    "PageIndex indexing process exited unexpectedly "
-                    f"(exit code {process.exitcode})."
-                )
-    finally:
-        receive_connection.close()
-        _stop_pageindex_process(process)
+    if collection is None:
+        raise RuntimeError("A PageIndex collection is required outside an API job.")
+    return collection.add(str(pdf_path))
 
 
 def _cloud_display_stem(cloud_name: str, fallback: str) -> str:
@@ -462,19 +363,16 @@ def index_long_document(
     pageindex_api_key = os.environ.get("PAGEINDEX_API_KEY", "")
 
     index_config = _build_index_config(config, bundle=bundle)
-    # Keep the CLI/direct path exactly as before (including its single client
-    # instance). API jobs have a cancellation flag and must defer creation to
-    # the child process so its SQLite connection is never inherited.
-    client = None
-    col = None
-    if cancel_event_var.get() is None:
-        client = PageIndexClient(
-            api_key=pageindex_api_key or None,
-            model=model,
-            storage_path=str(openkb_dir),
-            index_config=index_config,
-        )
-        col = client.collection()
+    # The vendored add runs in the calling thread, so one client instance serves
+    # both CLI and API paths; there is no process boundary to inherit a SQLite
+    # connection across.
+    client = PageIndexClient(
+        api_key=pageindex_api_key or None,
+        model=model,
+        storage_path=str(openkb_dir),
+        index_config=index_config,
+    )
+    col = client.collection()
 
     # Add PDF (retry up to 3 times — PageIndex TOC accuracy is stochastic)
     max_retries = 3
@@ -505,19 +403,6 @@ def index_long_document(
                 raise RuntimeError(
                     f"Failed to index {pdf_path.name} after {max_retries} attempts: {exc}"
                 ) from exc
-
-    # The cancellable add may have run in a child process. Open a fresh parent
-    # client only after it finishes so SQLite connections are never inherited
-    # across a process boundary.
-    if client is None:
-        client = PageIndexClient(
-            api_key=pageindex_api_key or None,
-            model=model,
-            storage_path=str(openkb_dir),
-            index_config=index_config,
-        )
-        col = client.collection()
-    assert col is not None
 
     # The PageIndex blob for doc_id is now durably on disk. The add mutation no
     # longer eagerly snapshots .openkb/files — it registers the new blob via

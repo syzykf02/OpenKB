@@ -1309,7 +1309,7 @@ def _cleanup_pageindex(
     if not (openkb_dir / "pageindex.db").exists():
         return False, "no PageIndex state"
 
-    from pageindex import PageIndexClient
+    from openkb.vendor.pageindex import PageIndexClient
 
     _setup_llm_key(kb_dir)
     config = resolve_effective_config(kb_dir)[0]

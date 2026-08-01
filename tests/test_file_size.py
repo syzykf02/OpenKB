@@ -24,6 +24,9 @@ _GRANDFATHERED = {
     "openkb/cli.py",  # monolithic Click entry point; split into command groups
     "openkb/agent/compiler.py",  # LLM wiki compiler; split into focused units
     "openkb/agent/chat.py",  # chat loop; extract cohesive concerns
+    # Vendored third-party pageindex package (not our code; do not split).
+    "openkb/vendor/pageindex/index/page_index.py",
+    "openkb/vendor/pageindex/index/utils.py",
 }
 
 

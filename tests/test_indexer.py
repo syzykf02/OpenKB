@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -200,75 +202,81 @@ class TestNormalizePageContent:
         assert _normalize_page_content([None, {}, {"content": ""}]) == []
 
 
-def test_api_cancel_terminates_inflight_pageindex_process(tmp_path, monkeypatch):
-    """An API cancellation must stop PageIndex even while ``add`` is blocked."""
-    import openkb.indexer as indexer
+def test_cancel_before_add_raises_without_calling_collection(tmp_path):
+    """A cancel already set must stop the in-thread add before it starts."""
     from openkb.ingest_cancel import IngestCancelled, cancel_event_var
 
-    class FakeConnection:
-        def poll(self, _timeout):
-            return False  # PageIndex has not finished yet.
-
-        def close(self):
-            pass
-
-    class FakeProcess:
-        def __init__(self):
-            self.started = False
-            self.terminated = False
-            self.alive = True
-            self.exitcode = None
-
-        def start(self):
-            self.started = True
-
-        def is_alive(self):
-            return self.alive
-
-        def terminate(self):
-            self.terminated = True
-            self.alive = False
-
-        def join(self, *_args):
-            pass
-
-    class FakeContext:
-        def __init__(self):
-            self.process = FakeProcess()
-
-        def Pipe(self, *, duplex):
-            assert duplex is False
-            return FakeConnection(), FakeConnection()
-
-        def Process(self, **_kwargs):
-            return self.process
-
-    context = FakeContext()
-    checks = 0
-
-    def cancel_on_second_check():
-        nonlocal checks
-        checks += 1
-        if checks == 2:
-            raise IngestCancelled("cancelled by test")
-
-    token = cancel_event_var.set(threading.Event())
-    monkeypatch.setattr(indexer.multiprocessing, "get_context", lambda _name: context)
-    monkeypatch.setattr(indexer, "check_cancelled", cancel_on_second_check)
+    col = MagicMock()
+    cancel = threading.Event()
+    cancel.set()
+    token = cancel_event_var.set(cancel)
     try:
-        with pytest.raises(IngestCancelled, match="cancelled by test"):
+        with pytest.raises(IngestCancelled):
             _add_document_interruptibly(
                 tmp_path / "long.pdf",
                 api_key=None,
                 model="test-model",
                 storage_path=tmp_path,
                 index_config=_build_index_config({}),
+                collection=col,
             )
     finally:
         cancel_event_var.reset(token)
 
-    assert context.process.started
-    assert context.process.terminated
+    col.add.assert_not_called()
+
+
+def test_cancel_mid_add_propagates_from_vendored_checkpoint(tmp_path):
+    """A cancel raised mid-add (as the vendored LLM checkpoints do) propagates."""
+    from openkb.ingest_cancel import IngestCancelled, cancel_event_var, check_cancelled
+
+    def add_that_cancels(_path):
+        # Simulate the vendored pipeline: cancel mid-index, then the next
+        # LLM-boundary checkpoint raises IngestCancelled.
+        cancel_event_var.get().set()
+        check_cancelled()
+        return "doc-id"
+
+    col = MagicMock()
+    col.add.side_effect = add_that_cancels
+    token = cancel_event_var.set(threading.Event())
+    try:
+        with pytest.raises(IngestCancelled):
+            _add_document_interruptibly(
+                tmp_path / "long.pdf",
+                api_key=None,
+                model="test-model",
+                storage_path=tmp_path,
+                index_config=_build_index_config({}),
+                collection=col,
+            )
+    finally:
+        cancel_event_var.reset(token)
+
+    col.add.assert_called_once()
+
+
+def test_add_runs_in_thread_and_returns_doc_id(tmp_path):
+    """Without cancellation, the in-thread add returns the doc id."""
+    from openkb.ingest_cancel import cancel_event_var
+
+    col = MagicMock()
+    col.add.return_value = "abc-123"
+    token = cancel_event_var.set(threading.Event())
+    try:
+        doc_id = _add_document_interruptibly(
+            tmp_path / "long.pdf",
+            api_key=None,
+            model="test-model",
+            storage_path=tmp_path,
+            index_config=_build_index_config({}),
+            collection=col,
+        )
+    finally:
+        cancel_event_var.reset(token)
+
+    assert doc_id == "abc-123"
+    col.add.assert_called_once_with(str(tmp_path / "long.pdf"))
 
 
 class TestIndexLongDocument:
@@ -727,3 +735,40 @@ def test_import_cloud_document_no_indices_avoids_oversized_range(kb_dir, monkeyp
     for r in ranges:
         a, b = (int(x) for x in r.split("-"))
         assert b - a + 1 <= 1000
+
+
+def test_vendored_pageindex_logs_reach_job_event_ring(tmp_path, monkeypatch):
+    """Logs emitted on ``openkb.vendor.pageindex.*`` from the add worker thread
+    surface as job ``log`` frames — the plumbing that puts PageIndex progress in
+    the UI log panel."""
+    from openkb.api_ingest import run_add_worker
+    from openkb.cli import AddFileResult
+    from openkb.jobs import JobRegistry
+
+    def fake_add(path, _target_kb, **_kwargs):
+        logging.getLogger("openkb.vendor.pageindex.test").info("indexing page 1/10")
+        return AddFileResult(path.name, str(path), "added", "fake add ok")
+
+    monkeypatch.setattr("openkb.api_helpers._add_for_api", fake_add)
+
+    async def main():
+        registry = JobRegistry()
+        source = tmp_path / "paper.pdf"
+        source.write_bytes(b"%PDF-1.4 fake")
+        job = registry.create("add", "kb", "add: paper.pdf")
+        registry.submit(
+            job, lambda j: run_add_worker(j, "kb", tmp_path, [(source, "paper.pdf")])
+        )
+        deadline = time.time() + 5
+        while time.time() < deadline and not job.terminal:
+            await asyncio.sleep(0.02)
+        return job
+
+    job = asyncio.run(main())
+    assert job.status == "done"
+    assert any(
+        f["event"] == "log"
+        and "indexing page 1/10" in f["data"]["message"]
+        and f["data"]["logger"] == "openkb.vendor.pageindex.test"
+        for f in job._events
+    )
