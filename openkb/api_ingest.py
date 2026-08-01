@@ -363,10 +363,22 @@ def start_recompile_job(
 async def run_recompile_worker(
     job: Job, kb_dir: Path, document_name: str, *, bundle=None
 ) -> dict[str, Any]:
-    """Run the existing recompile pipeline while projecting it onto one file row."""
+    """Run the existing recompile pipeline while projecting it onto one file row.
+
+    Logs are captured the same way as ``run_add_worker``: a ``JobLogHandler`` on
+    the ``openkb`` logger forwards this worker thread's compiler log records as
+    job ``log`` frames, so the UI panel shows recompile progress.
+    """
     from openkb.cli import iter_recompile
 
+    loop = asyncio.get_running_loop()
+    handler = JobLogHandler(job, loop)
+    _raise_openkb_log_level()
+    logging.getLogger(_OPENKB_LOGGER_NAME).addHandler(handler)
     token = cancel_event_var.set(job.cancel_event)
+    # The recompile pipeline runs on the event-loop thread; bind its ident so
+    # the handler only forwards this job's records (not concurrent jobs').
+    job.thread_id = threading.get_ident()
     try:
         job.record(
             "file_start",
@@ -413,3 +425,5 @@ async def run_recompile_worker(
         return final
     finally:
         cancel_event_var.reset(token)
+        logging.getLogger(_OPENKB_LOGGER_NAME).removeHandler(handler)
+        _restore_openkb_log_level()

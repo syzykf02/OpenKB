@@ -2988,3 +2988,35 @@ class TestFrontmatterDashBoundary:
         assert 'type: "Concept"' in text
         # Must have a properly closed frontmatter block (two '---' occurrences).
         assert text.count("---") >= 2
+
+
+def test_emit_progress_writes_stdout_and_logger(capsys):
+    """emit_progress must keep the CLI stdout line (basicConfig is WARNING) and
+    also emit an INFO record so API jobs can surface it as a log frame."""
+    import logging
+
+    from openkb.agent.progress import emit_progress
+
+    records: list[logging.LogRecord] = []
+
+    class Recorder(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = Recorder(level=logging.INFO)
+    lg = logging.getLogger("openkb.agent.compiler")
+    # Job workers raise the "openkb" tree to INFO (_raise_openkb_log_level), so
+    # the record passes the logger level — simulate that here.
+    lg.setLevel(logging.INFO)
+    lg.addHandler(handler)
+    try:
+        emit_progress("    step_one... 1.2s", logger_name="openkb.agent.compiler")
+    finally:
+        lg.removeHandler(handler)
+        lg.setLevel(logging.NOTSET)
+
+    out = capsys.readouterr().out
+    assert "    step_one... 1.2s\n" in out
+    assert len(records) == 1
+    assert records[0].getMessage() == "    step_one... 1.2s"
+    assert records[0].levelno == logging.INFO

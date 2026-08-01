@@ -334,3 +334,37 @@ def test_job_runs_without_attached_viewer(monkeypatch, kb_dir):
         assert "file_start" in names and "file_done" in names and "final" in names
         final = dict(events)["final"]
         assert final["added_count"] == 1
+
+
+def test_recompile_worker_captures_compiler_logs(monkeypatch, tmp_path):
+    """The recompile worker forwards compiler log records as job ``log`` frames,
+    so the UI panel shows recompile progress (regression: it previously mounted
+    no JobLogHandler, so the panel stayed empty)."""
+    import logging
+
+    from openkb.api_ingest import run_recompile_worker
+
+    async def fake_iter_recompile(kb_dir, document_name, *, bundle=None):
+        logging.getLogger("openkb.agent.compiler").info("recompiling page X")
+        yield {"event": "doc", "status": "ok", "message": "ok"}
+        yield {"event": "final", "status": "done"}
+
+    monkeypatch.setattr("openkb.cli.iter_recompile", fake_iter_recompile)
+
+    async def main():
+        registry = JobRegistry()
+        job = registry.create("recompile", "kb", "recompile: doc")
+        registry.submit(job, lambda j: run_recompile_worker(j, tmp_path, "doc"))
+        deadline = time.time() + 5
+        while time.time() < deadline and not job.terminal:
+            await asyncio.sleep(0.02)
+        return job
+
+    job = asyncio.run(main())
+    assert job.status == "done"
+    assert any(
+        f["event"] == "log"
+        and "recompiling page X" in f["data"]["message"]
+        and f["data"]["logger"] == "openkb.agent.compiler"
+        for f in job._events
+    )

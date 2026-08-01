@@ -652,6 +652,11 @@ export function useJobs(kb: string, opts: UseJobsOptions): UseJobsResult {
           prevStatusRef.current[accepted.job_id] = 'queued'
           notifyJobIdRef.current = accepted.job_id
           notifiedRef.current.delete(accepted.job_id)
+          setJobData((prev) => ({
+            ...prev,
+            [accepted.job_id]: { files: prev[accepted.job_id]?.files ?? [], logs: [] },
+          }))
+          selectJob(accepted.job_id)
           void refreshFileTasks()
         } catch (e) {
           toast.error(errMsg(e))

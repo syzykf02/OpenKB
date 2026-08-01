@@ -30,6 +30,7 @@ from pathlib import Path
 import litellm
 
 from openkb import frontmatter
+from openkb.agent.progress import emit_progress
 from openkb.config import (
     DEFAULT_ENTITY_TYPES,
     get_base_url,
@@ -538,8 +539,7 @@ async def _llm_call_async(
     truncated = _warn_if_truncated(response, step_name, kwargs.get("max_tokens"))
 
     elapsed = time.time() - t0
-    sys.stdout.write(f"    {step_name}... {_format_usage(elapsed, response.usage)}\n")
-    sys.stdout.flush()
+    emit_progress(f"    {step_name}... {_format_usage(elapsed, response.usage)}")
     logger.debug(
         "LLM response [%s]:\n%s", step_name, content[:500] + ("..." if len(content) > 500 else "")
     )
@@ -599,8 +599,7 @@ def _warn_if_truncated(response, step_name: str, max_tokens: int | None) -> bool
         return False
     cap = f" (max_tokens={max_tokens})" if max_tokens else ""
     logger.warning("LLM [%s] hit length limit%s — output may be truncated.", step_name, cap)
-    sys.stdout.write(f"    [WARN] {step_name} hit length limit{cap} — output may be truncated.\n")
-    sys.stdout.flush()
+    emit_progress(f"    [WARN] {step_name} hit length limit{cap} — output may be truncated.")
     return True
 
 
@@ -1749,11 +1748,10 @@ async def _compile_concepts(
             preview,
         )
         logger.debug("Concepts plan raw output (full, %d chars): %s", len(plan_raw), plan_raw)
-        sys.stdout.write(
+        emit_progress(
             f"    [WARN] concepts plan unparseable for {doc_name} — "
-            f"no concept pages generated. See log (stderr) for details.\n"
+            "no concept pages generated. See log (stderr) for details."
         )
-        sys.stdout.flush()
         if rewrite_summary:
             _write_v1_summary_stripped()
         _update_index(wiki_dir, doc_name, [], doc_brief=doc_brief, doc_type=doc_type)
@@ -1842,11 +1840,10 @@ async def _compile_concepts(
         + len(entity_related)
     )
     if original_total > 0 and post_filter_total == 0:
-        sys.stdout.write(
+        emit_progress(
             f"    [WARN] plan for {doc_name} had {original_total} "
-            f"item(s), all dropped as malformed — see log (stderr).\n"
+            "item(s), all dropped as malformed — see log (stderr)."
         )
-        sys.stdout.flush()
 
     if (
         not create_items
@@ -2056,13 +2053,9 @@ async def _compile_concepts(
     total = len(tasks)
     etotal = len(entity_tasks)
     if tasks:
-        sys.stdout.write(f"    Generating {total} concept(s) (concurrency={max_concurrency})...\n")
-        sys.stdout.flush()
+        emit_progress(f"    Generating {total} concept(s) (concurrency={max_concurrency})...")
     if entity_tasks:
-        sys.stdout.write(
-            f"    Generating {etotal} entity(ies) (concurrency={max_concurrency})...\n"
-        )
-        sys.stdout.flush()
+        emit_progress(f"    Generating {etotal} entity(ies) (concurrency={max_concurrency})...")
 
     results, entity_results = ([], [])
     if tasks or entity_tasks:
@@ -2093,11 +2086,10 @@ async def _compile_concepts(
         written = len(pending_writes)
         if written < total:
             reason = ", ".join(sorted(set(failure_types))) if failure_types else "see log (stderr)"
-            sys.stdout.write(
+            emit_progress(
                 f"    [WARN] {total} concept(s) planned but only {written} written "
-                f"for {doc_name} ({reason}).\n"
+                f"for {doc_name} ({reason})."
             )
-            sys.stdout.flush()
 
     if entity_tasks:
         entity_failure_types: list[str] = []
@@ -2116,11 +2108,10 @@ async def _compile_concepts(
                 if entity_failure_types
                 else "see log (stderr)"
             )
-            sys.stdout.write(
+            emit_progress(
                 f"    [WARN] {etotal} entity(ies) planned but only {ewritten} written "
-                f"for {doc_name} ({reason}).\n"
+                f"for {doc_name} ({reason})."
             )
-            sys.stdout.flush()
 
     # Strip ghost wikilinks from entity bodies and write each page.
     for name, page_content, brief, etype in entity_pending:
