@@ -3020,3 +3020,39 @@ def test_emit_progress_writes_stdout_and_logger(capsys):
     assert len(records) == 1
     assert records[0].getMessage() == "    step_one... 1.2s"
     assert records[0].levelno == logging.INFO
+
+
+def test_llm_call_off_loop_does_not_block_event_loop(monkeypatch):
+    """The recompile pipeline's synchronous LLM call must run off the event
+    loop: while ``llm_call_off_loop`` is awaiting a long completion, other
+    tasks on the loop still get to run."""
+    import asyncio
+    import time
+
+    from openkb.agent import llm_offload
+
+    def fake_llm_call(*args, **kwargs):
+        time.sleep(0.5)  # stand in for a slow synchronous litellm.completion
+        return "ok"
+
+    monkeypatch.setattr("openkb.agent.compiler._llm_call", fake_llm_call)
+
+    async def main():
+        ticks = 0
+
+        async def ticker():
+            nonlocal ticks
+            for _ in range(5):
+                await asyncio.sleep(0.05)
+                ticks += 1
+
+        ticker_task = asyncio.create_task(ticker())
+        result = await llm_offload.llm_call_off_loop("model", [], "step")
+        await ticker_task
+        return result, ticks
+
+    result, ticks = asyncio.run(main())
+    assert result == "ok"
+    # If the call ran on the loop, the ticker would get zero slices during the
+    # 0.5s sleep; off-loop it keeps ticking.
+    assert ticks >= 2

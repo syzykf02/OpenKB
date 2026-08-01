@@ -23,6 +23,7 @@ intentional v0.x scope.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Literal, Union
 
@@ -114,7 +115,9 @@ class Generator:
                 bundle=self.bundle,
             )
             self.validation = validate_skill(self.output_dir)
-            regenerate_marketplace(self.kb_dir)
+            # ``regenerate_marketplace`` shells out to `git config`; off-load it
+            # so a deck/skill generation never blocks the API event loop.
+            await asyncio.to_thread(regenerate_marketplace, self.kb_dir)
             return self.output_dir
 
         # target_type == "deck"

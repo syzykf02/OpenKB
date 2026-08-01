@@ -30,6 +30,7 @@ from pathlib import Path
 import litellm
 
 from openkb import frontmatter
+from openkb.agent.llm_offload import llm_call_off_loop
 from openkb.agent.progress import emit_progress
 from openkb.config import (
     DEFAULT_ENTITY_TYPES,
@@ -86,7 +87,6 @@ and [[wikilinks]] to concepts that could become cross-document concept pages
 
 Return ONLY valid JSON, no fences.
 """
-
 
 # Default entity-type enum lives in the config layer (so config validation is
 # centralized there and reusable by any command). ``_ENTITY_TYPE_LIST`` /
@@ -1697,7 +1697,7 @@ async def _compile_concepts(
     # (system + doc + summary) for the plan call and every concept call.
     summary_msg = {"role": "assistant", "content": _cached_text(summary)}
 
-    plan_raw = _llm_call(
+    plan_raw = await llm_call_off_loop(
         model,
         [
             system_msg,
@@ -2158,7 +2158,7 @@ async def _compile_concepts(
         try:
             # No max_tokens cap — matches the v1 summary call. The rewrite
             # prompt asks the model to keep length within ±20% of the v1.
-            rewrite_raw = _llm_call(
+            rewrite_raw = await llm_call_off_loop(
                 model,
                 [
                     system_msg,
@@ -2321,7 +2321,7 @@ async def compile_short_doc(
     # for the plan + concept-generation calls, then rewritten into a final
     # v2 (with a whitelist of known wikilink targets) inside
     # _compile_concepts before being written to disk.
-    summary_raw = _llm_call(
+    summary_raw = await llm_call_off_loop(
         model,
         [system_msg, doc_msg],
         "summary",
@@ -2421,7 +2421,7 @@ async def compile_long_doc(
     }
 
     # --- Step 1: Generate overview ---
-    overview = _llm_call(model, [system_msg, doc_msg], "overview", bundle=bundle)
+    overview = await llm_call_off_loop(model, [system_msg, doc_msg], "overview", bundle=bundle)
     check_cancelled()
 
     # --- Steps 2-4: Concept plan → generate/update → index ---
